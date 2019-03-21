@@ -13,15 +13,24 @@
 # limitations under the License.
 # ==============================================================================
 
-import threading
+import hashlib
+import hmac
+import os
 
 
-LOCK = threading.Lock()
-JOB_ID = -1
+SECRET_LENGTH = 32  # bytes
+DIGEST_LENGTH = 32  # bytes
+HOROVOD_SECRET_KEY = '_HOROVOD_SECRET_KEY'
 
 
-def next_job_id():
-    global LOCK, JOB_ID
-    with LOCK:
-        JOB_ID += 1
-        return JOB_ID
+def make_secret_key():
+    return os.urandom(SECRET_LENGTH)
+
+
+def compute_digest(key, message):
+    return hmac.new(key, message, hashlib.sha256).digest()
+
+
+def check_digest(key, message, digest):
+    computed_digest = compute_digest(key, message)
+    return hmac.compare_digest(computed_digest, digest)

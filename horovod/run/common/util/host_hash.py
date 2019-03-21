@@ -13,15 +13,24 @@
 # limitations under the License.
 # ==============================================================================
 
-import threading
+import hashlib
+import os
+import socket
+
+NAMESPACE_PATH = '/proc/self/ns'
 
 
-LOCK = threading.Lock()
-JOB_ID = -1
+def _namespaces():
+    hash = ''
+    if os.path.exists(NAMESPACE_PATH):
+        for file in os.listdir(NAMESPACE_PATH):
+            if hash != '':
+                hash += ' '
+            hash += os.readlink(os.path.join(NAMESPACE_PATH, file))
+    return hash
 
 
-def next_job_id():
-    global LOCK, JOB_ID
-    with LOCK:
-        JOB_ID += 1
-        return JOB_ID
+def host_hash():
+    hostname = socket.gethostname()
+    ns = _namespaces()
+    return '%s-%s' % (hostname, hashlib.md5(ns.encode('ascii')).hexdigest())

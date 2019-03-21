@@ -13,15 +13,15 @@
 # limitations under the License.
 # ==============================================================================
 
-import threading
+import base64
+import cloudpickle
 
 
-LOCK = threading.Lock()
-JOB_ID = -1
+def loads_base64(encoded):
+    decoded = base64.b64decode(encoded)
+    return cloudpickle.loads(decoded)
 
 
-def next_job_id():
-    global LOCK, JOB_ID
-    with LOCK:
-        JOB_ID += 1
-        return JOB_ID
+def dumps_base64(obj):
+    serialized = cloudpickle.dumps(obj)
+    return base64.b64encode(serialized).decode('ascii')

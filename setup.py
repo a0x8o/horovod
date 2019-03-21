@@ -623,6 +623,8 @@ def build_tf_extension(build_ext, options):
 
 
 def parse_version(version_str):
+    if "dev" in version_str:
+        return 9999999999
     m = re.match('^(\d+)(?:\.(\d+))?(?:\.(\d+))?(?:\.(\d+))?', version_str)
     if m is None:
         return None
@@ -968,4 +970,5 @@ setup(name='horovod',
       # so it's only necessary for `build*` or `bdist*` actions.
       setup_requires=['cffi>=1.4.0', 'cloudpickle', 'psutil', 'six'] if is_build_action() else [],
       install_requires=['cffi>=1.4.0', 'cloudpickle', 'psutil', 'six'],
-      zip_safe=False)
+      zip_safe=False,
+      scripts=['bin/horovodrun'])
