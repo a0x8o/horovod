@@ -13,19 +13,12 @@
 # limitations under the License.
 # ==============================================================================
 
-from horovod.run.common.service import task_service
+import re
 
 
-class SparkTaskService(task_service.BasicTaskService):
-    NAME_FORMAT = 'task service #%d'
-
-    def __init__(self, index, key):
-        super(SparkTaskService, self).__init__(SparkTaskService.NAME_FORMAT % index, key)
+# List of regular expressions to ignore environment variables by.
+IGNORE_REGEXES = {'BASH_FUNC_.*\(\)'}
 
 
-class SparkTaskClient(task_service.BasicTaskClient):
-
-    def __init__(self, index, task_addresses, key, verbose, match_intf=False):
-        super(SparkTaskClient, self).__init__(SparkTaskService.NAME_FORMAT % index,
-                                              task_addresses, key, verbose,
-                                              match_intf=match_intf)
+def is_exportable(v):
+    return not any(re.match(r, v) for r in IGNORE_REGEXES)
