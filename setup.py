@@ -22,14 +22,17 @@ import subprocess
 import sys
 import textwrap
 import traceback
+from copy import deepcopy
 from distutils.errors import CompileError, DistutilsError, \
     DistutilsPlatformError, LinkError
+from distutils.sysconfig import customize_compiler
 from distutils.version import LooseVersion
 
 from setuptools import setup, Extension, find_packages
 from setuptools.command.build_ext import build_ext
 
 from horovod import __version__
+from horovod.common.util import env
 
 class CMakeExtension(Extension):
     def __init__(self, name, cmake_lists_dir='.', sources=[], **kwa):
@@ -684,6 +687,83 @@ def get_common_options(build_ext):
                 LIBRARIES=LIBRARIES)
 
 
+def enumerate_binaries_in_path():
+    for path_dir in os.getenv('PATH', '').split(':'):
+        if os.path.isdir(path_dir):
+            for bin_file in sorted(os.listdir(path_dir)):
+                yield path_dir, bin_file
+
+
+def determine_gcc_version(compiler):
+    try:
+        compiler_macros = subprocess.check_output(
+            '%s -dM -E - </dev/null' % compiler,
+            shell=True, universal_newlines=True).split('\n')
+        for m in compiler_macros:
+            version_match = re.match('^#define __VERSION__ "(.*?)"$', m)
+            if version_match:
+                return LooseVersion(version_match.group(1))
+        print('INFO: Unable to determine version of the compiler %s.' % compiler)
+
+    except subprocess.CalledProcessError:
+        print('INFO: Unable to determine version of the compiler %s.\n%s'
+              '' % (compiler, traceback.format_exc()))
+
+    return None
+
+
+def find_gxx_compiler_in_path():
+    compilers = []
+
+    for path_dir, bin_file in enumerate_binaries_in_path():
+        if re.match('^g\\+\\+(?:-\\d+(?:\\.\\d+)*)?$', bin_file):
+            # g++, or g++-7, g++-4.9, or g++-4.8.5
+            compiler = os.path.join(path_dir, bin_file)
+            compiler_version = determine_gcc_version(compiler)
+            if compiler_version:
+                compilers.append((compiler, compiler_version))
+
+    return compilers
+
+
+def find_matching_gcc_compiler_path(gxx_compiler_version):
+    for path_dir, bin_file in enumerate_binaries_in_path():
+        if re.match('^gcc(?:-\\d+(?:\\.\\d+)*)?$', bin_file):
+            # gcc, or gcc-7, gcc-4.9, or gcc-4.8.5
+            compiler = os.path.join(path_dir, bin_file)
+            compiler_version = determine_gcc_version(compiler)
+            if compiler_version == gxx_compiler_version:
+                return compiler
+
+    print('INFO: Unable to find gcc compiler (version %s).'  % gxx_compiler_version)
+    return None
+
+
+def remove_offensive_gcc_compiler_options(compiler_version):
+    offensive_replacements = dict()
+    if compiler_version < LooseVersion('4.9'):
+        offensive_replacements = {
+            '-Wdate-time': '',
+            '-fstack-protector-strong': '-fstack-protector'
+        }
+
+    if offensive_replacements:
+        from sysconfig import get_config_var
+        cflags = get_config_var('CONFIGURE_CFLAGS')
+        cppflags = get_config_var('CONFIGURE_CPPFLAGS')
+        ldshared = get_config_var('LDSHARED')
+
+        for k, v in offensive_replacements.items():
+            cflags = cflags.replace(k, v)
+            cppflags = cppflags.replace(k, v)
+            ldshared = ldshared.replace(k, v)
+
+        return cflags, cppflags, ldshared
+
+    # Use defaults
+    return None, None, None
+
+
 def build_tf_extension(build_ext, options):
     check_tf_version()
     tf_compile_flags, tf_link_flags = get_tf_flags(
@@ -696,10 +776,65 @@ def build_tf_extension(build_ext, options):
     tensorflow_mpi_lib.extra_compile_args = options['COMPILE_FLAGS'] + \
                                             tf_compile_flags
     tensorflow_mpi_lib.extra_link_args = options['LINK_FLAGS'] + tf_link_flags
+
     tensorflow_mpi_lib.library_dirs = options['LIBRARY_DIRS']
     tensorflow_mpi_lib.libraries = options['LIBRARIES']
 
-    build_ext.build_extension(tensorflow_mpi_lib)
+    cc_compiler = cxx_compiler = cflags = cppflags = None
+    if sys.platform.startswith('linux') and not os.getenv('CC') and not os.getenv('CXX'):
+        # Determine g++ version compatible with this TensorFlow installation
+        import tensorflow as tf
+        if hasattr(tf, 'version'):
+            # Since TensorFlow 1.13.0
+            tf_compiler_version = LooseVersion(tf.version.COMPILER_VERSION)
+        else:
+            tf_compiler_version = LooseVersion(tf.COMPILER_VERSION)
+
+        if tf_compiler_version.version[0] == 4:
+            # g++ 4.x is ABI-incompatible with g++ 5.x+ due to std::function change
+            # See: https://github.com/tensorflow/tensorflow/issues/27067
+            maximum_compiler_version = LooseVersion('5')
+        else:
+            maximum_compiler_version = LooseVersion('999')
+
+        # Find the compatible compiler of the highest version
+        compiler_version = LooseVersion('0')
+        for candidate_cxx_compiler, candidate_compiler_version in find_gxx_compiler_in_path():
+            if candidate_compiler_version >= tf_compiler_version and \
+                    candidate_compiler_version < maximum_compiler_version:
+                candidate_cc_compiler = \
+                    find_matching_gcc_compiler_path(candidate_compiler_version)
+                if candidate_cc_compiler and candidate_compiler_version > compiler_version:
+                    cc_compiler = candidate_cc_compiler
+                    cxx_compiler = candidate_cxx_compiler
+                    compiler_version = candidate_compiler_version
+            else:
+                print('INFO: Compiler %s (version %s) is not usable for this TensorFlow '
+                      'installation. Require g++ (version >=%s, <%s).' %
+                      (candidate_cxx_compiler, candidate_compiler_version,
+                       tf_compiler_version, maximum_compiler_version))
+
+        if cc_compiler:
+            print('INFO: Compilers %s and %s (version %s) selected for TensorFlow plugin build.'
+                  '' % (cc_compiler, cxx_compiler, compiler_version))
+        else:
+            raise DistutilsPlatformError(
+                'Could not find compiler compatible with this TensorFlow installation.\n'
+                'Please check the Horovod website for recommended compiler versions.\n'
+                'To force a specific compiler version, set CC and CXX environment variables.')
+
+        cflags, cppflags, ldshared = remove_offensive_gcc_compiler_options(compiler_version)
+
+    try:
+        with env(CC=cc_compiler, CXX=cxx_compiler, CFLAGS=cflags, CPPFLAGS=cppflags,
+                 LDSHARED=ldshared):
+            if options['BUILD_GLOO']:
+                build_cmake(build_ext, gloo_lib, 'tf', tensorflow_mpi_lib)
+            customize_compiler(build_ext.compiler)
+            build_ext.build_extension(tensorflow_mpi_lib)
+    finally:
+        # Revert to the default compiler settings
+        customize_compiler(build_ext.compiler)
 
 
 def parse_version(version_str):
@@ -768,7 +903,15 @@ def is_mx_cuda():
     return False
 
 
-def build_mx_extension(build_ext, options):
+def build_mx_extension(build_ext, global_options):
+    # Backup the options, preventing other plugins access libs that
+    # compiled with compiler of this plugin
+    options = deepcopy(global_options)
+
+    # First build gloo
+    if options['BUILD_GLOO']:
+        build_cmake(build_ext, gloo_lib, 'mxnet', options=options)
+
     check_mx_version()
     mx_compile_flags, mx_link_flags = get_mx_flags(
         build_ext, options['COMPILE_FLAGS'])
@@ -905,12 +1048,20 @@ class protect_files(object):
             os.rename(file + '.protected', file)
 
 
-def build_torch_extension(build_ext, options, torch_version):
+def build_torch_extension(build_ext, global_options, torch_version):
+    # Backup the options, preventing other plugins access libs that
+    # compiled with compiler of this plugin
+    options = deepcopy(global_options)
+
     have_cuda = is_torch_cuda()
     if not have_cuda and check_macro(options['MACROS'], 'HAVE_CUDA'):
         raise DistutilsPlatformError(
             'Horovod build with GPU support was requested, but this PyTorch '
             'installation does not support CUDA.')
+
+    # Build gloo
+    if options['BUILD_GLOO']:
+        build_cmake(build_ext, gloo_lib, 'torch', options=options)
 
     # Update HAVE_CUDA to mean that PyTorch supports CUDA. Internally, we will be checking
     # HOROVOD_GPU_(ALLREDUCE|ALLGATHER|BROADCAST) to decide whether we should use GPU
@@ -1000,30 +1151,81 @@ def build_torch_extension_v2(build_ext, options, torch_version):
     else:
         # CUDAExtension fails with `ld: library not found for -lcudart` if CUDA is not present
         from torch.utils.cpp_extension import CppExtension as TorchExtension
+
     ext = TorchExtension(torch_mpi_lib_v2.name,
-                         define_macros=updated_macros,
-                         include_dirs=options['INCLUDES'],
-                         sources=options['SOURCES'] + [
-                             'horovod/torch/mpi_ops_v2.cc',
-                             'horovod/torch/handle_manager.cc',
-                             'horovod/torch/ready_event.cc',
-                             'horovod/torch/cuda_util.cc',
-                             'horovod/torch/adapter_v2.cc'],
-                         extra_compile_args=options['COMPILE_FLAGS'],
-                         extra_link_args=options['LINK_FLAGS'],
-                         library_dirs=options['LIBRARY_DIRS'],
-                         libraries=options['LIBRARIES'])
+                        define_macros=updated_macros,
+                        include_dirs=options['INCLUDES'],
+                        sources=options['SOURCES'] + [
+                            'horovod/torch/mpi_ops_v2.cc',
+                            'horovod/torch/handle_manager.cc',
+                            'horovod/torch/ready_event.cc',
+                            'horovod/torch/cuda_util.cc',
+                            'horovod/torch/adapter_v2.cc'],
+                        extra_compile_args=options['COMPILE_FLAGS'],
+                        extra_link_args=options['LINK_FLAGS'],
+                        library_dirs=options['LIBRARY_DIRS'],
+                        libraries=options['LIBRARIES'])
 
     # Patch an existing torch_mpi_lib_v2 extension object.
     for k, v in ext.__dict__.items():
         torch_mpi_lib_v2.__dict__[k] = v
-    build_ext.build_extension(torch_mpi_lib_v2)
+
+    cc_compiler = cxx_compiler = cflags = cppflags = None
+    if sys.platform.startswith('linux') and not os.getenv('CC') and not os.getenv('CXX'):
+        from torch.utils.cpp_extension import check_compiler_abi_compatibility
+
+        # Find the compatible compiler of the highest version
+        compiler_version = LooseVersion('0')
+        for candidate_cxx_compiler, candidate_compiler_version in find_gxx_compiler_in_path():
+            if check_compiler_abi_compatibility(candidate_cxx_compiler):
+                candidate_cc_compiler = \
+                    find_matching_gcc_compiler_path(candidate_compiler_version)
+                if candidate_cc_compiler and candidate_compiler_version > compiler_version:
+                    cc_compiler = candidate_cc_compiler
+                    cxx_compiler = candidate_cxx_compiler
+                    compiler_version = candidate_compiler_version
+            else:
+                print('INFO: Compiler %s (version %s) is not usable for this PyTorch '
+                      'installation, see the warning above.' %
+                      (candidate_cxx_compiler, candidate_compiler_version))
+
+        if cc_compiler:
+            print('INFO: Compilers %s and %s (version %s) selected for PyTorch plugin build.'
+                  '' % (cc_compiler, cxx_compiler, compiler_version))
+        else:
+            raise DistutilsPlatformError(
+                'Could not find compiler compatible with this PyTorch installation.\n'
+                'Please check the Horovod website for recommended compiler versions.\n'
+                'To force a specific compiler version, set CC and CXX environment variables.')
+
+        cflags, cppflags, ldshared = remove_offensive_gcc_compiler_options(compiler_version)
+
+    try:
+        with env(CC=cc_compiler, CXX=cxx_compiler, CFLAGS=cflags, CPPFLAGS=cppflags,
+                 LDSHARED=ldshared):
+            if options['BUILD_GLOO']:
+                build_cmake(build_ext, gloo_lib, 'torchv2', ext)
+            customize_compiler(build_ext.compiler)
+            build_ext.build_extension(torch_mpi_lib_v2)
+    finally:
+        # Revert to the default compiler settings
+        customize_compiler(build_ext.compiler)
 
 
-def build_cmake(build_ext, ext, output_dir, options):
+def build_cmake(build_ext, ext, prefix, plugin_ext=None, options=None):
     cmake_bin = 'cmake'
 
-    # Statically linked archive files go into the provided output directory
+    # All statically linked libraries will be placed here
+    lib_output_dir = os.path.abspath(os.path.join(build_ext.build_temp, 'lib', prefix))
+    if not os.path.exists(lib_output_dir):
+        os.makedirs(lib_output_dir)
+
+    if plugin_ext:
+        plugin_ext.library_dirs += [lib_output_dir]
+
+    if options:
+        options['LIBRARY_DIRS'] += [lib_output_dir]
+
     extdir = os.path.abspath(
         os.path.dirname(build_ext.get_ext_fullpath(ext.name)))
     config = 'Debug' if build_ext.debug else 'Release'
@@ -1032,7 +1234,7 @@ def build_cmake(build_ext, ext, output_dir, options):
         '-DCMAKE_BUILD_TYPE=' + config,
         '-DCMAKE_LIBRARY_OUTPUT_DIRECTORY_{}={}'.format(config.upper(), extdir),
         '-DCMAKE_ARCHIVE_OUTPUT_DIRECTORY_{}={}'.format(config.upper(),
-                                                        output_dir),
+                                                        lib_output_dir),
     ]
     cmake_build_args = [
         '--config', config,
@@ -1053,8 +1255,12 @@ def build_cmake(build_ext, ext, output_dir, options):
     except OSError as e:
         raise RuntimeError('CMake failed: {}'.format(str(e)))
 
-    # Add the library so other extensions will link against it during compilation
-    options['LIBRARIES'] += [ext.name]
+    # Add the library so the plugin will link against it during compilation
+    if plugin_ext:
+        plugin_ext.libraries += [ext.name]
+
+    if options:
+        options['LIBRARIES'] += [ext.name]
 
 
 # run the customize_compiler
@@ -1063,23 +1269,19 @@ class custom_build_ext(build_ext):
         options = get_common_options(self)
         built_plugins = []
 
-        # All statically linked libraries will be placed here
-        lib_output_dir = os.path.abspath(os.path.join(self.build_temp, 'lib'))
-        if not os.path.exists(lib_output_dir):
-            os.makedirs(lib_output_dir)
-        options['LIBRARY_DIRS'] += [lib_output_dir]
-
         if is_mac:
-            print('INFO: Submodule Gloo cannot compile on MacOS, skip compiling'
-                ' Gloo.')
+            print('INFO: Submodule Gloo cannot compile on MacOS, skip compiling '
+                  'Gloo.')
+            options['BUILD_GLOO'] = False
         elif not have_cmake:
             # TODO: install cmake in local environment after entry point issue
             #  has some updates.
             #  https://github.com/scikit-build/cmake-python-distributions/issues/80
             print('INFO: Submodule Gloo cannot compile without CMake, '
-                'skip compiling Gloo.')
+                  'skip compiling Gloo.')
+            options['BUILD_GLOO'] = False
         else:
-            build_cmake(self, gloo_lib, lib_output_dir, options)
+            options['BUILD_GLOO'] = True
 
         # If PyTorch is installed, it must be imported before TensorFlow, otherwise
         # we may get an error: dlopen: cannot load any more object with static TLS
