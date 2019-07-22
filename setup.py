@@ -754,9 +754,12 @@ def remove_offensive_gcc_compiler_options(compiler_version):
         ldshared = get_config_var('LDSHARED')
 
         for k, v in offensive_replacements.items():
-            cflags = cflags.replace(k, v)
-            cppflags = cppflags.replace(k, v)
-            ldshared = ldshared.replace(k, v)
+            if cflags:
+                cflags = cflags.replace(k, v)
+            if cppflags:
+                cppflags = cppflags.replace(k, v)
+            if ldshared:
+                ldshared = ldshared.replace(k, v)
 
         return cflags, cppflags, ldshared
 
@@ -764,7 +767,11 @@ def remove_offensive_gcc_compiler_options(compiler_version):
     return None, None, None
 
 
-def build_tf_extension(build_ext, options):
+def build_tf_extension(build_ext, global_options):
+    # Backup the options, preventing other plugins access libs that
+    # compiled with compiler of this plugin
+    options = deepcopy(global_options)
+
     check_tf_version()
     tf_compile_flags, tf_link_flags = get_tf_flags(
         build_ext, options['COMPILE_FLAGS'])
@@ -1118,7 +1125,11 @@ def build_torch_extension(build_ext, global_options, torch_version):
         build_ext.build_extension(setuptools_ext)
 
 
-def build_torch_extension_v2(build_ext, options, torch_version):
+def build_torch_extension_v2(build_ext, global_options, torch_version):
+    # Backup the options, preventing other plugins access libs that
+    # compiled with compiler of this plugin
+    options = deepcopy(global_options)
+    
     have_cuda = is_torch_cuda_v2(build_ext, include_dirs=options['INCLUDES'],
                                  extra_compile_args=options['COMPILE_FLAGS'])
     if not have_cuda and check_macro(options['MACROS'], 'HAVE_CUDA'):
