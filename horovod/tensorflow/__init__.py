@@ -19,7 +19,6 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
-
 from horovod.common.util import check_extension
 
 check_extension('horovod.tensorflow', 'HOROVOD_WITH_TENSORFLOW', __file__, 'mpi_lib')
@@ -28,10 +27,13 @@ from horovod.tensorflow.compression import Compression
 from horovod.tensorflow.mpi_ops import allgather, broadcast, _allreduce
 from horovod.tensorflow.mpi_ops import init, shutdown
 from horovod.tensorflow.mpi_ops import size, local_size, rank, local_rank
-from horovod.tensorflow.mpi_ops import mpi_threads_supported
+from horovod.tensorflow.mpi_ops import mpi_threads_supported, mpi_enabled, mpi_built
+from horovod.tensorflow.mpi_ops import gloo_enabled, gloo_built
+from horovod.tensorflow.mpi_ops import nccl_built, ddl_built, mlsl_built
 from horovod.tensorflow.util import _executing_eagerly, _make_subgraph, _cache
 
 import tensorflow as tf
+
 
 def allreduce(tensor, average=True, device_dense='', device_sparse='',
               compression=Compression.none):
@@ -111,7 +113,15 @@ def broadcast_variables(variables, root_rank):
     return broadcast_group(variables, root_rank)
 
 
-if hasattr(tf, 'global_variables'):
+try:
+    _global_variables = tf.global_variables
+except AttributeError:
+    try:
+        _global_variables = tf.compat.v1.global_variables
+    except AttributeError:
+        _global_variables = None
+
+if _global_variables is not None:
     def broadcast_global_variables(root_rank):
         """Broadcasts all global variables from root rank to all other processes.
 
@@ -121,15 +131,31 @@ if hasattr(tf, 'global_variables'):
             root_rank: rank of the process from which global variables will be broadcasted
                        to all other processes.
         """
-        return broadcast_variables(tf.global_variables(), root_rank)
+        if _executing_eagerly():
+            raise RuntimeError(
+                "hvd.broadcast_global_variables() does not support eager execution. "
+                "Please use `hvd.broadcast_variables(<model/optimizer variables>)` instead."
+            )
 
+        return broadcast_variables(_global_variables(), root_rank)
 
-if hasattr(tf, 'train') and hasattr(tf.train, 'SessionRunHook'):
-    if hasattr(tf, 'estimator') and hasattr(tf.estimator, 'SessionRunHook'):
-        _SessionRunHook = tf.estimator.SessionRunHook
-    else:
+try:
+    _get_default_graph = tf.get_default_graph
+except AttributeError:
+    try:
+        _get_default_graph = tf.compat.v1.get_default_graph
+    except AttributeError:
+        _get_default_graph = None
+
+try:
+    _SessionRunHook = tf.estimator.SessionRunHook
+except AttributeError:
+    try:
         _SessionRunHook = tf.train.SessionRunHook
+    except AttributeError:
+        _SessionRunHook = None
 
+if _SessionRunHook is not None and _get_default_graph is not None:
     class BroadcastGlobalVariablesHook(_SessionRunHook):
         """
         SessionRunHook that will broadcast all global variables from root rank
@@ -158,7 +184,7 @@ if hasattr(tf, 'train') and hasattr(tf.train, 'SessionRunHook'):
             self.device = device
 
         def begin(self):
-            if not self.bcast_op or self.bcast_op.graph != tf.get_default_graph():
+            if not self.bcast_op or self.bcast_op.graph != _get_default_graph():
                 with tf.device(self.device):
                     self.bcast_op = broadcast_global_variables(self.root_rank)
 
@@ -189,19 +215,18 @@ def _make_allreduce_grads_fn(name, device_dense, device_sparse,
         return allreduce_grads
 
 
-if hasattr(tf, 'compat') and hasattr(tf.compat, 'v1') and \
-        hasattr(tf.compat.v1, 'train') and hasattr(tf.compat.v1.train, 'Optimizer'):
+try:
     # TensorFlow 2.x
     _LegacyOptimizer = tf.compat.v1.train.Optimizer
-elif hasattr(tf, 'train') and hasattr(tf.train, 'Optimizer'):
-    # TensorFlow 1.x
-    _LegacyOptimizer = tf.train.Optimizer
-else:
-    # Future TensorFlow versions
-    _LegacyOptimizer = None
+except AttributeError:
+    try:
+        # TensorFlow 1.x
+        _LegacyOptimizer = tf.train.Optimizer
+    except AttributeError:
+        # Future TensorFlow versions
+        _LegacyOptimizer = None
 
-
-if _LegacyOptimizer:
+if _LegacyOptimizer is not None:
     class _DistributedOptimizer(_LegacyOptimizer):
         """An optimizer that wraps another tf.Optimizer, using an allreduce to
         average gradient values before applying gradients to model weights."""

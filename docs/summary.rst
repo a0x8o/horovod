@@ -258,11 +258,20 @@ See `Run Horovod <running.rst>`_ for more details, including RoCE/InfiniBand twe
 
 7. To run in Singularity, see `Singularity <https://github.com/sylabs/examples/tree/master/machinelearning/horovod>`_.
 
-Estimator API
--------------
-Horovod supports Estimator API and regular TensorFlow in similar ways.
+Gloo
+----
+`Gloo <https://github.com/facebookincubator/gloo>`_ is an open source collective communications library developed by Facebook.
 
-See a full training `example <examples/tensorflow_mnist_estimator.py>`_.
+Gloo comes included with Horovod, and allows users to run Horovod without requiring MPI to be installed. Gloo support only requires
+that you have `CMake <https://cmake.org/>`_ installed, and is only supported on Linux at this time.
+
+For environments that have support both MPI and Gloo, you can choose to use Gloo at runtime by passing the ``--gloo`` argument to ``horovodrun``:
+
+.. code-block:: bash
+
+     $ horovodrun --gloo -np 2 python train.py
+
+Gloo support is still early in its development, and more features are coming soon.
 
 mpi4py
 ------
@@ -314,6 +323,7 @@ to batch small *allreduce* operations, which results in improved performance. We
 
 See `here <tensor-fusion.rst>`__ for full details and tweaking instructions.
 
+
 Horovod Timeline
 ----------------
 Horovod has the ability to record the timeline of its activity, called Horovod Timeline.
@@ -323,6 +333,15 @@ Horovod has the ability to record the timeline of its activity, called Horovod T
 
 Use Horovod timeline to analyze Horovod performance.
 See `here <timeline.rst>`__ for full details and usage instructions.
+
+
+Automated Performance Tuning
+----------------------------
+Selecting the right values to efficiently make use of Tensor Fusion and other advanced Horovod features can involve
+a good amount of trial and error. We provide a system to automate this performance optimization process called
+**autotuning**, which you can enable with a single command line argument to ``horovodrun``.
+
+See `here <autotune.rst>`__ for full details and usage instructions.
 
 
 Guides
@@ -368,6 +387,11 @@ References
 The Horovod source code was based off the Baidu `tensorflow-allreduce <https://github.com/baidu-research/tensorflow-allreduce>`_
 repository written by Andrew Gibiansky and Joel Hestness. Their original work is described in the article
 `Bringing HPC Techniques to Deep Learning <http://andrew.gibiansky.com/blog/machine-learning/baidu-allreduce/>`_.
+
+Mailing lists
+-------------
+Subscribe to `Horovod Announce <https://lists.lfai.foundation/g/horovod-announce>`_ and 
+`Horovod Technical-Discuss <https://lists.lfai.foundation/g/horovod-technical-discuss>`_ to stay up to date.
 
 
 .. inclusion-marker-end-do-not-remove

@@ -65,27 +65,32 @@ LibType ParseCPUOpsFromEnv() {
       cpu_operation = LibType::MLSL;
     } else {
       throw std::runtime_error("Unsupported CPU operation type, only MPI, "
-                               "MLSL and Gloo are supported");
+                               "MLSL, and Gloo are supported");
     }
   }
 
-  LOG(INFO) << "Using " << TypeName(cpu_operation)
+  LOG(DEBUG) << "Using " << TypeName(cpu_operation)
             << " to perform CPU operations.";
   return cpu_operation;
 }
 
 LibType ParseControllerOpsFromEnv() {
-  LibType controller = LibType::MPI;
-#if HAVE_GLOO
+  // Always default to MPI if available.
+  LibType controller;
+#if HAVE_MPI
+  controller = LibType::MPI;
+#elif HAVE_GLOO
   controller = LibType::GLOO;
 #endif
 
+  // If specified during compilation
 #if HOROVOD_CONTROLLER_DEFAULT == 'G'
   controller = LibType::GLOO;
 #elif HOROVOD_CONTROLLER_DEFAULT == 'M'
   controller = LibType::MPI;
 #endif
 
+  // If specified during runtime
   const char* user_cpu_operation = std::getenv(HOROVOD_CONTROLLER);
   if (user_cpu_operation != nullptr) {
     if (strcasecmp(user_cpu_operation, HOROVOD_MPI) == 0) {
@@ -98,23 +103,17 @@ LibType ParseControllerOpsFromEnv() {
     }
   }
 
-  LOG(INFO) << "Using " << TypeName(controller)
+  LOG(DEBUG) << "Using " << TypeName(controller)
             << " to perform controller operations.";
   return controller;
 }
 
-void SetBoolFromEnv(const char* env, bool& val, bool value_if_set) {
-  auto env_value = std::getenv(env);
-  if (env_value != nullptr && std::strtol(env_value, nullptr, 10) > 0) {
-    val = value_if_set;
+const char* ParseGlooIface() {
+  const char* gloo_iface = std::getenv(HOROVOD_GLOO_IFACE);
+  if (gloo_iface == nullptr) {
+    gloo_iface = GLOO_DEFAULT_IFACE;
   }
-}
-
-void SetIntFromEnv(const char* env, int& val) {
-  auto env_value = std::getenv(env);
-  if (env_value != nullptr) {
-    val = std::strtol(env_value, nullptr, 10);
-  }
+  return gloo_iface;
 }
 
 void ParseStallInspectorFromEnv(StallInspector& stall_inspector) {
@@ -136,12 +135,28 @@ void ParseStallInspectorFromEnv(StallInspector& stall_inspector) {
   }
 }
 
-const char* ParseGlooIface() {
-  const char* gloo_iface = std::getenv(HOROVOD_GLOO_IFACE);
-  if (gloo_iface == nullptr) {
-    gloo_iface = GLOO_DEFAULT_IFACE;
+void SetBoolFromEnv(const char* env, bool& val, bool value_if_set) {
+  auto env_value = std::getenv(env);
+  if (env_value != nullptr && std::strtol(env_value, nullptr, 10) > 0) {
+    val = value_if_set;
   }
-  return gloo_iface;
+}
+
+void SetIntFromEnv(const char* env, int& val) {
+  auto env_value = std::getenv(env);
+  if (env_value != nullptr) {
+    val = std::strtol(env_value, nullptr, 10);
+  }
+}
+
+int GetIntEnvOrDefault(const char* env_variable, int default_value) {
+  auto env_value = std::getenv(env_variable);
+  return env_value != nullptr ? std::strtol(env_value, nullptr, 10) : default_value;
+}
+
+double GetDoubleEnvOrDefault(const char* env_variable, double default_value) {
+  auto env_value = std::getenv(env_variable);
+  return env_value != nullptr ? std::strtod(env_value, nullptr) : default_value;
 }
 
 } // namespace common

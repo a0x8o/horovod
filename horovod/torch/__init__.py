@@ -36,7 +36,9 @@ from horovod.torch.mpi_ops import broadcast, broadcast_async, broadcast_, broadc
 from horovod.torch.mpi_ops import poll, synchronize
 from horovod.torch.mpi_ops import init, shutdown
 from horovod.torch.mpi_ops import size, local_size, rank, local_rank
-from horovod.torch.mpi_ops import mpi_threads_supported
+from horovod.torch.mpi_ops import mpi_threads_supported, mpi_enabled, mpi_built
+from horovod.torch.mpi_ops import gloo_enabled, gloo_built
+from horovod.torch.mpi_ops import nccl_built, ddl_built, mlsl_built
 
 import torch
 import collections
@@ -349,12 +351,12 @@ def broadcast_optimizer_state(optimizer, root_rank):
     # new unwrapped scalar value via a callback.
     def _create_callback(pid, name, t, p):
         def _from_tensor():
-            state_dict['state'][pid][name] = t(p.numpy()[0])
+            state_dict['state'][pid][name] = t(p.cpu().numpy()[0])
         return _from_tensor
 
     def _create_option_callback(index, option_key, option_tensor, dtypes):
         def _from_tensor():
-            optimizer.param_groups[index][option_key] = _recursive_cast(option_tensor.numpy()[0], dtypes)
+            optimizer.param_groups[index][option_key] = _recursive_cast(option_tensor.cpu().numpy()[0], dtypes)
         return _from_tensor
 
     # Param groups are an ordered list, normally there is only one per model,

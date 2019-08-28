@@ -10,9 +10,9 @@ ARG MPI_KIND=OpenMPI
 ARG PYTHON_VERSION=2.7
 ARG TENSORFLOW_PACKAGE=tensorflow-gpu==1.14.0
 ARG KERAS_PACKAGE=keras==2.2.4
-ARG PYTORCH_PACKAGE=https://download.pytorch.org/whl/cu100/torch-1.1.0-cp27-cp27mu-linux_x86_64.whl
-ARG TORCHVISION_PACKAGE=https://download.pytorch.org/whl/cu100/torchvision-0.3.0-cp27-cp27mu-linux_x86_64.whl
-ARG MXNET_PACKAGE=mxnet-cu100==1.4.1
+ARG PYTORCH_PACKAGE=torch==1.2.0
+ARG TORCHVISION_PACKAGE=torchvision==0.4.0
+ARG MXNET_PACKAGE=mxnet-cu100==1.5.0
 ARG PYSPARK_PACKAGE=pyspark==2.4.0
 ARG HOROVOD_BUILD_FLAGS=HOROVOD_GPU_ALLREDUCE=NCCL
 ARG HOROVOD_MIXED_INSTALL=0
@@ -58,7 +58,7 @@ RUN if [[ ${MPI_KIND} == "OpenMPI" ]]; then \
         wget -O /tmp/openmpi-3.0.0-bin.tar.gz https://github.com/horovod/horovod/files/1596799/openmpi-3.0.0-bin.tar.gz && \
             cd /usr/local && tar -zxf /tmp/openmpi-3.0.0-bin.tar.gz && ldconfig && \
             echo "mpirun -allow-run-as-root -np 2 -H localhost:2 -bind-to none -map-by slot -mca mpi_abort_print_stack 1" > /mpirun_command; \
-    else \
+    elif [[ ${MPI_KIND} == "MPICH" ]]; then \
         apt-get install -y mpich && \
             echo "mpirun -np 2" > /mpirun_command; \
     fi
@@ -67,7 +67,9 @@ RUN if [[ ${MPI_KIND} == "OpenMPI" ]]; then \
 RUN echo NCCL_DEBUG=INFO >> /etc/nccl.conf
 
 # Install mpi4py.
-RUN pip install mpi4py
+RUN if [[ ${MPI_KIND} != "None" ]]; then \
+        pip install mpi4py; \
+    fi
 
 ### END OF CACHE ###
 COPY . /horovod

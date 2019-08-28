@@ -15,6 +15,7 @@
 
 import re
 
+LOG_LEVEL_STR = ['FATAL', 'ERROR', 'WARNING', 'INFO', 'DEBUG', 'TRACE']
 
 # List of regular expressions to ignore environment variables by.
 IGNORE_REGEXES = {'BASH_FUNC_.*\(\)', 'OLDPWD'}
