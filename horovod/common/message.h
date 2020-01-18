@@ -1,5 +1,6 @@
 // Copyright 2016 The TensorFlow Authors. All Rights Reserved.
 // Modifications copyright (C) 2019 Uber Technologies, Inc.
+// Modifications copyright Microsoft
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -34,10 +35,11 @@ enum DataType {
   HOROVOD_FLOAT32 = 7,
   HOROVOD_FLOAT64 = 8,
   HOROVOD_BOOL = 9,
-  HOROVOD_BYTE = 10,
 };
 
 const std::string& DataType_Name(DataType value);
+
+std::size_t DataType_Size(DataType value);
 
 // A Request is a message sent from a rank greater than zero to the
 // coordinator (rank zero), informing the coordinator of an operation that
@@ -45,7 +47,7 @@ const std::string& DataType_Name(DataType value);
 class Request {
 public:
   enum RequestType {
-    ALLREDUCE = 0, ALLGATHER = 1, BROADCAST = 2, JOIN = 3
+    ALLREDUCE = 0, ALLGATHER = 1, BROADCAST = 2, JOIN = 3, ADASUM = 4
   };
 
   static const std::string& RequestType_Name(RequestType value);
@@ -130,7 +132,7 @@ private:
 class Response {
 public:
   enum ResponseType {
-    ALLREDUCE = 0, ALLGATHER = 1, BROADCAST = 2, JOIN = 3, ERROR = 4
+    ALLREDUCE = 0, ALLGATHER = 1, BROADCAST = 2, JOIN = 3, ADASUM = 4, ERROR = 5
   };
 
   static const std::string& ResponseType_Name(ResponseType value);

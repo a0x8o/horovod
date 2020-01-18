@@ -1,5 +1,5 @@
 # Copyright (C) 2019 Uber Technologies, Inc.
-#
+# Modifications copyright Microsoft
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -16,7 +16,7 @@
 import atexit
 import ctypes
 
-import horovod.common.util as util
+from horovod.common import util as util
 
 
 class HorovodBasics(object):
@@ -25,6 +25,10 @@ class HorovodBasics(object):
     def __init__(self, pkg_path, *args):
         full_path = util.get_extension_full_path(pkg_path, *args)
         self.MPI_LIB_CTYPES = ctypes.CDLL(full_path, mode=ctypes.RTLD_GLOBAL)
+
+        self.Average = self.MPI_LIB_CTYPES.horovod_reduce_op_average()
+        self.Sum = self.MPI_LIB_CTYPES.horovod_reduce_op_sum()
+        self.Adasum = self.MPI_LIB_CTYPES.horovod_reduce_op_adasum()
 
     def init(self, comm=None):
         """A function that initializes Horovod.
@@ -115,6 +119,15 @@ class HorovodBasics(object):
                 'Horovod has not been initialized; use hvd.init().')
         return local_rank
 
+    def is_homogeneous(self):
+        """Returns True if the cluster is homogeneous.
+
+        Returns:
+          A boolean value indicating whether every node in the cluster has same number of ranks.
+        """
+        is_homogeneous = self.MPI_LIB_CTYPES.horovod_is_homogeneous()
+        return bool(is_homogeneous)
+
     def mpi_threads_supported(self):
         """A function that returns a flag indicating whether MPI multi-threading is supported.
 
@@ -189,10 +202,10 @@ class HorovodBasics(object):
         """
         return bool(self.MPI_LIB_CTYPES.horovod_ddl_built())
 
-    def mlsl_built(self):
-        """Returns True if Horovod was compiled with MLSL support.
+    def ccl_built(self):
+        """Returns True if Horovod was compiled with oneCCL support.
 
         Returns:
-          A boolean value indicating whether MLSL support was compiled.
+          A boolean value indicating whether oneCCL support was compiled.
         """
-        return bool(self.MPI_LIB_CTYPES.horovod_mlsl_built())
+        return bool(self.MPI_LIB_CTYPES.horovod_ccl_built())
