@@ -14,35 +14,38 @@
 // limitations under the License.
 // =============================================================================
 
-#ifndef HOROVOD_DDL_OPERATIONS_H
-#define HOROVOD_DDL_OPERATIONS_H
-
-#include <ddl.hpp>
+#ifndef HOROVOD_MPI_GPU_OPERATIONS_H
+#define HOROVOD_MPI_GPU_OPERATIONS_H
 
 #include "gpu_operations.h"
+#include "../mpi/mpi_context.h"
 
 namespace horovod {
 namespace common {
 
-struct DDLContext {
-  int32_t ddl_local_device_id = 0;
-};
-
-class DDLAllreduce : public GPUAllreduce {
+class MPI_GPUAllreduce : public GPUAllreduce {
 public:
-  DDLAllreduce(DDLContext* ddl_context,
-               GPUContext* gpu_context,
-               HorovodGlobalState* global_state);
+  MPI_GPUAllreduce(MPIContext* mpi_context, GPUContext* gpu_context, HorovodGlobalState* global_state);
+  virtual ~MPI_GPUAllreduce()=default;
 
   Status Execute(std::vector<TensorTableEntry>& entries, const Response& response) override;
 
-  static void DDLInit(DDLContext* ddl_context, GPUContext* gpu_context);
+protected:
+  MPIContext* mpi_context_;
+};
+
+class MPI_GPUAllgather : public GPUAllgather {
+public:
+  MPI_GPUAllgather(MPIContext* mpi_context, GPUContext* gpu_context, HorovodGlobalState* global_state);
+  virtual ~MPI_GPUAllgather()=default;
+
+  Status Execute(std::vector<TensorTableEntry>& entries, const Response& response) override;
 
 protected:
-  DDLContext* ddl_context_;
+  MPIContext* mpi_context_;
 };
 
 } // namespace common
 } // namespace horovod
 
-#endif //HOROVOD_DDL_OPERATIONS_H
+#endif //HOROVOD_MPI_GPU_OPERATIONS_H
