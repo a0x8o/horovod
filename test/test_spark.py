@@ -736,6 +736,26 @@ class SparkTests(unittest.TestCase):
             hdfs_root = 'file:///user/test/output'
             HDFSStore(hdfs_root)
 
+        # Case 6: override paths, no prefix
+        hdfs_root = '/user/prefix'
+        store = HDFSStore(hdfs_root,
+                          train_path='/user/train_path',
+                          val_path='/user/val_path',
+                          test_path='/user/test_path')
+        assert store.get_train_data_path() == 'hdfs:///user/train_path', hdfs_root
+        assert store.get_val_data_path() == 'hdfs:///user/val_path', hdfs_root
+        assert store.get_test_data_path() == 'hdfs:///user/test_path', hdfs_root
+
+        # Case 7: override paths, prefix
+        hdfs_root = 'hdfs:///user/prefix'
+        store = HDFSStore(hdfs_root,
+                          train_path='hdfs:///user/train_path',
+                          val_path='hdfs:///user/val_path',
+                          test_path='hdfs:///user/test_path')
+        assert store.get_train_data_path() == 'hdfs:///user/train_path', hdfs_root
+        assert store.get_val_data_path() == 'hdfs:///user/val_path', hdfs_root
+        assert store.get_test_data_path() == 'hdfs:///user/test_path', hdfs_root
+
     def test_spark_task_service_env(self):
         key = secret.make_secret_key()
         service_env = dict([(key, '{} value'.format(key))
@@ -772,3 +792,22 @@ class SparkTests(unittest.TestCase):
         with spark_session('test_get_available_devices', gpus=2):
             res = horovod.spark.run(fn, env={'PATH': os.environ.get('PATH')}, verbose=0)
             self.assertListEqual([(['0'], 0), (['1'], 1)], res)
+
+    def test_to_list(self):
+        none_output = util.to_list(None, 1)
+        assert none_output is none_output
+
+        out1 = util.to_list('one_item', 1)
+        assert out1 == ['one_item']
+
+        out2 = util.to_list('one_item', 2)
+        assert out2 == ['one_item', 'one_item']
+
+        out3 = util.to_list(['one_item'], 1)
+        assert out3 == ['one_item']
+
+        out4 = util.to_list(['item1', 'item2'], 2)
+        assert out4 == ['item1', 'item2']
+
+        with pytest.raises(ValueError):
+            util.to_list(['item1', 'item2'], 4)

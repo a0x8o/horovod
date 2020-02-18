@@ -51,6 +51,8 @@ class DistributedOptimizer(mx.optimizer.Optimizer):
         return self._optimizer.create_state_multi_precision(index, weight)
 
     def _do_allreduce(self, index, grad):
+        if size() == 1: return
+
         if isinstance(index, (tuple, list)):
             for i in range(len(index)):
                 allreduce_(grad[i], average=False,
@@ -98,11 +100,12 @@ class DistributedTrainer(mx.gluon.Trainer):
         self._scale /= size()
 
     def _allreduce_grads(self):
-        # sort needed for Python < 3.6 is not guaranteed
-        for i, param in enumerate(sorted(self._params, key=lambda p: p.name)):
+        if size() == 1: return
+
+        for i, param in enumerate(self._params):
             if param.grad_req != 'null':
                 allreduce_(param.list_grad()[0], average=False,
-                           name=str(i), priority=-i)
+                           name=param.name, priority=-i)
 
 
 # Wrapper to inject Horovod broadcast after parameter initialization
@@ -128,6 +131,8 @@ def broadcast_parameters(params, root_rank=0):
         root_rank: The rank of the process from which parameters will be
                    broadcasted to all other processes.
     """
+    if size() == 1: return
+
     tensors = []
     if isinstance(params, dict):
         tensors = [p for _, p in sorted(params.items())]
