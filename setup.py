@@ -118,16 +118,17 @@ def get_supported_instruction_set_flags(flags_to_check):
 def get_cpp_flags(build_ext):
     last_err = None
     default_flags = ['-std=c++11', '-fPIC', '-O2', '-Wall', '-fassociative-math', '-ffast-math', '-ftree-vectorize', '-funsafe-math-optimizations']
-    avx_fma_flags = get_supported_instruction_set_flags(['-mf16c', '-mavx', '-mfma'])
+    build_arch_flags_env = os.environ.get('HOROVOD_BUILD_ARCH_FLAGS')
+    build_arch_flags = get_supported_instruction_set_flags(['-mf16c', '-mavx', '-mfma']) if build_arch_flags_env is None else build_arch_flags_env.split()
     if sys.platform == 'darwin':
         # Darwin most likely will have Clang, which has libc++.
-        flags_to_try = [default_flags + ['-stdlib=libc++'] + avx_fma_flags,
-                        default_flags + avx_fma_flags,
+        flags_to_try = [default_flags + ['-stdlib=libc++'] + build_arch_flags,
+                        default_flags + build_arch_flags,
                         default_flags + ['-stdlib=libc++'],
                         default_flags]
     else:
-        flags_to_try = [default_flags + avx_fma_flags,
-                        default_flags + ['-stdlib=libc++'] + avx_fma_flags,
+        flags_to_try = [default_flags + build_arch_flags,
+                        default_flags + ['-stdlib=libc++'] + build_arch_flags,
                         default_flags,
                         default_flags + ['-stdlib=libc++']]
     for cpp_flags in flags_to_try:
@@ -1511,6 +1512,21 @@ class custom_build_ext(build_ext):
 require_list = ['cloudpickle', 'psutil', 'pyyaml', 'six']
 test_require_list = ['mock', 'pytest', 'pytest-forked']
 
+# framework dependencies
+tensorflow_require_list = ['tensorflow']
+tensorflow_gpu_require_list = ['tensorflow-gpu']
+keras_require_list = ['keras>=2.0.8,!=2.0.9,!=2.1.0,!=2.1.1']
+pytorch_require_list = ['torch','torchvision']
+mxnet_require_list = ['mxnet>=1.4.1']
+spark_require_list = ['h5py>=2.9', 'numpy', 'petastorm==0.8.2', 'pyarrow>=0.15.0', 'pyspark>=2.3.2']  # Petastorm 0.7.7 is not compatible with pyarrow<0.15.0
+# all frameworks' dependencies
+all_frameworks_require_list = tensorflow_require_list + \
+                              tensorflow_gpu_require_list + \
+                              keras_require_list + \
+                              pytorch_require_list + \
+                              mxnet_require_list + \
+                              spark_require_list
+
 # Skip cffi if pytorch extension explicitly disabled
 if not os.environ.get('HOROVOD_WITHOUT_PYTORCH'):
     require_list.append('cffi>=1.4.0')
@@ -1536,15 +1552,15 @@ setup(name='horovod',
       # so it's only necessary for `build*` or `bdist*` actions.
       setup_requires=require_list if is_build_action() else [],
       install_requires=require_list,
-      test_requires=test_require_list,
+      tests_require=test_require_list,
       extras_require={
-          'spark':  [
-              'h5py>=2.9',
-              'numpy',
-              'petastorm==0.8.2',
-              'pyarrow>=0.15.0',  # Petastorm 0.7.7 is not compatible with < 0.15.0
-              'pyspark>=2.3.2'
-          ],
+          'all-frameworks': all_frameworks_require_list,
+          'tensorflow': tensorflow_require_list,
+          'tensorflow-gpu': tensorflow_gpu_require_list,
+          'keras': keras_require_list,
+          'pytorch': pytorch_require_list,
+          'mxnet': mxnet_require_list,
+          'spark': spark_require_list
       },
       zip_safe=False,
       scripts=['bin/horovodrun'])

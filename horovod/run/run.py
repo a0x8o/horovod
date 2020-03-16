@@ -559,6 +559,11 @@ def parse_args():
                                        help='Extra MPI arguments to pass to mpirun. '
                                        'They need to be passed with the equal sign to avoid parsing issues. '
                                        'e.g. --mpi-args="--map-by ppr:6:node"')
+    group_library_options.add_argument('--tcp', action='store_true', dest='tcp_flag',
+                                       help='If this flag is set, only TCP is used for communication.')
+    group_library_options.add_argument('--binding-args', action='store', dest='binding_args',
+                                       help='Process binding arguments. Default is socket for Spectrum MPI '
+                                       'and no binding for other cases. e.g. --binding-args="--rankfile myrankfile"')
     group_library_options.add_argument('--num-nccl-streams', action=make_override_action(override_args),
                                        type=int, default=1,
                                        help='Number of NCCL streams. Only applies when running with NCCL support. '
@@ -659,6 +664,8 @@ class HorovodArgs(object):
         # library arguments
         self.mpi_threads_disable = None
         self.mpi_args = None
+        self.tcp_flag = None
+        self.binding_args = None
         self.num_nccl_streams = None
         self.ccl_bgt_affinity = None
         self.gloo_timeout_seconds = None
@@ -684,12 +691,12 @@ def parse_host_files(filename):
     :return: Comma separated string of <IP address> or <host name>:<Number of GPUs>
     """
     hosts = []
-    for line in open(filename):
-        line = line.rstrip()
-        hostname = line.split()[0]
-        slots = line.split('=')[1]
-        hosts.append('{name}:{slots}'.format(name=hostname, slots=slots))
-
+    with open(filename, 'r') as f:
+        for line in f.readlines():
+            line = line.rstrip()
+            hostname = line.split()[0]
+            slots = line.split('=')[1]
+            hosts.append('{name}:{slots}'.format(name=hostname, slots=slots))
     return ','.join(hosts)
 
 
@@ -730,6 +737,8 @@ def _run(args):
     settings = hvd_settings.Settings(verbose=2 if args.verbose else 0,
                                      ssh_port=args.ssh_port,
                                      extra_mpi_args=args.mpi_args,
+                                     tcp_flag=args.tcp_flag,
+                                     binding_args=args.binding_args,
                                      key=secret.make_secret_key(),
                                      timeout=tmout,
                                      num_hosts=len(all_host_names),
@@ -881,6 +890,7 @@ def run(
         verbose=None,
         use_gloo=None,
         use_mpi=None,
+        mpi_args=None,
         network_interface=None):
     """
     Launch a Horovod job to run the specified process function and get the return value.
@@ -919,6 +929,7 @@ def run(
                      be the default if Horovod was not built with MPI support.
     :param use_mpi: Run Horovod using the MPI controller. This will
                     be the default if Horovod was built with MPI support.
+    :param mpi_args: Extra arguments for the MPI controller. This is only used when use_mpi is True.
     :param network_interface: Specify the network interface for communication.
 
     :return: Return a list which contains values return by all Horovod processes.
@@ -944,6 +955,7 @@ def run(
     hargs.hostfile = hostfile
     hargs.start_timeout = start_timeout
     hargs.ssh_port = ssh_port
+    hargs.mpi_args = mpi_args
     hargs.disable_cache = disable_cache
     hargs.output_filename = output_filename
     hargs.verbose = verbose
