@@ -17,46 +17,26 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
-import contextlib
 import copy
 import os
-import sys
+import itertools
 import unittest
 import warnings
 
 import pytest
-from mock import MagicMock, patch
+import mock
+from mock import MagicMock
 
-from horovod.run.common.util import config_parser, secret, settings as hvd_settings, timeout
+import horovod
+from horovod.run.common.util import codec, config_parser, secret, settings as hvd_settings, timeout
 from horovod.run.common.util.host_hash import _hash, host_hash
-from horovod.run.mpi_run import _get_mpi_implementation_flags, _LARGE_CLUSTER_THRESHOLD as large_cluster_threshold, mpi_run
-from horovod.run.run import parse_args, parse_host_files
+from horovod.run.mpi_run import _get_mpi_implementation, _get_mpi_implementation_flags,\
+    _LARGE_CLUSTER_THRESHOLD as large_cluster_threshold, mpi_available, mpi_run,\
+    _OMPI_IMPL, _SMPI_IMPL, _MPICH_IMPL, _UNKNOWN_IMPL, _MISSING_IMPL
+from horovod.run.runner import parse_args, parse_host_files, run_controller
 from horovod.run.js_run import js_run, generate_jsrun_rankfile
 
-from common import temppath
-
-
-@contextlib.contextmanager
-def override_args(tool=None, *args):
-    old = sys.argv[:]
-    try:
-        if tool:
-            sys.argv[0] = tool
-        sys.argv[1:] = args
-        yield
-    finally:
-        sys.argv = old
-
-
-@contextlib.contextmanager
-def override_env(env):
-    old = os.environ.copy()
-    try:
-        os.environ.update(env)
-        yield
-    finally:
-        os.environ.clear()
-        os.environ.update(old)
+from common import is_built, lsf_and_jsrun, override_args, override_env, temppath
 
 
 class RunTests(unittest.TestCase):
@@ -245,6 +225,127 @@ class RunTests(unittest.TestCase):
             self.assertNotEqual(host_hash(), hash)
         self.assertEqual(host_hash(), hash)
 
+    def test_settings_dump_drops_key(self):
+        settings = hvd_settings.Settings(verbose=2, key="a secret key")
+        clone = codec.loads_base64(codec.dumps_base64(settings))
+        self.assertEqual(settings.verbose, clone.verbose)
+        self.assertIsNotNone(settings.key)
+        self.assertIsNone(clone.key)
+
+    def test_get_mpi_implementation(self):
+        def test(output, expected, exit_code=0):
+            ret = (output, exit_code) if output is not None else None
+            with mock.patch("horovod.run.mpi_run.tiny_shell_exec.execute", return_value=ret):
+                implementation = _get_mpi_implementation()
+                self.assertEqual(expected, implementation)
+
+        test(("mpirun (Open MPI) 2.1.1\n"
+              "Report bugs to http://www.open-mpi.org/community/help/\n"), _OMPI_IMPL)
+
+        test("OpenRTE", _OMPI_IMPL)
+
+        test("IBM Spectrum MPI", _SMPI_IMPL)
+
+        test(("HYDRA build details:\n"
+              "    Version:           3.3a2\n"
+              "    Configure options: 'MPICHLIB_CFLAGS=-g -O2'\n"), _MPICH_IMPL)
+
+        test("Unknown MPI v1.00", _UNKNOWN_IMPL)
+
+        test("output", exit_code=1, expected=_MISSING_IMPL)
+
+        test(None, _MISSING_IMPL)
+
+    def test_run_controller(self):
+        def test(use_gloo, use_mpi, use_js,
+                 gloo_is_built, mpi_is_built,
+                 lsf_exists, jsrun_installed,
+                 expected, exception):
+            print('testing run controller with gloo={gloo} mpi={mpi} js={js} '
+                  'gloo_built={gloo_is_built} mpi_built={mpi_is_built} '
+                  'lsf_exists={lsf} js_installed={js_is_installed} '
+                  'expected={expected} exception={exception}'
+                  .format(gloo=use_gloo, mpi=use_mpi, js=use_js,
+                          gloo_is_built=gloo_is_built, mpi_is_built=mpi_is_built,
+                          lsf=lsf_exists, js_is_installed=jsrun_installed,
+                          expected=expected, exception=exception))
+
+            gloo_run = MagicMock()
+            mpi_run = MagicMock()
+            js_run = MagicMock()
+
+            with is_built(gloo_is_built, mpi_is_built):
+                with lsf_and_jsrun(lsf_exists, jsrun_installed):
+                    if exception is not None:
+                        with pytest.raises(ValueError, match=exception) as e:
+                            run_controller(use_gloo, gloo_run, use_mpi, mpi_run, use_js, js_run, verbosity=2)
+                        return
+                    run_controller(use_gloo, gloo_run, use_mpi, mpi_run, use_js, js_run, verbosity=2)
+
+            if expected == "gloo":
+                gloo_run.assert_called_once()
+                mpi_run.assert_not_called()
+                js_run.assert_not_called()
+            elif expected == "mpi":
+                gloo_run.assert_not_called()
+                mpi_run.assert_called_once()
+                js_run.assert_not_called()
+            elif expected == "js":
+                gloo_run.assert_not_called()
+                mpi_run.assert_not_called()
+                js_run.assert_called_once()
+            else:
+                raise ValueError("unsupported framework: {}".format(expected))
+
+        bool_values = [False, True]
+        bool_values_and_none = [None, False, True]
+
+        for use_gloo, use_mpi, use_js, \
+            gloo_is_built, mpi_is_built, \
+            lsf_exists, jsrun_installed in \
+            itertools.product(bool_values_and_none, bool_values_and_none, bool_values_and_none,
+                              bool_values, bool_values,
+                              bool_values, bool_values):
+
+            expected = exception = None
+            if use_gloo:
+                if gloo_is_built:
+                    expected = 'gloo'
+                else:
+                    exception = '^Gloo support has not been built\.  If this is not expected, ensure CMake is installed ' \
+                                'and reinstall Horovod with HOROVOD_WITH_GLOO=1 to debug the build error\.$'
+            elif use_mpi:
+                if mpi_is_built:
+                    expected = 'mpi'
+                else:
+                    exception = '^MPI support has not been built\.  If this is not expected, ensure MPI is installed ' \
+                                'and reinstall Horovod with HOROVOD_WITH_MPI=1 to debug the build error\.$'
+            elif use_js:
+                if mpi_is_built:
+                    if lsf_exists:
+                        expected = 'js'
+                    else:
+                        exception = 'Horovod did not detect an LSF job.  The jsrun launcher can only be used in that environment. ' \
+                                    'Please, pick a different launcher for other environments.'
+                else:
+                    exception = '^MPI support has not been built\.  If this is not expected, ensure MPI is installed ' \
+                                'and reinstall Horovod with HOROVOD_WITH_MPI=1 to debug the build error\.$'
+            elif mpi_is_built:
+                if lsf_exists and jsrun_installed:
+                    expected = 'js'
+                else:
+                    expected = 'mpi'
+            elif gloo_is_built:
+                expected = 'gloo'
+            else:
+                exception = 'Neither MPI nor Gloo support has been built\. Try reinstalling Horovod ensuring that ' \
+                            'either MPI is installed \(MPI\) or CMake is installed \(Gloo\)\.'
+
+            test(use_gloo, use_mpi, use_js,
+                 gloo_is_built, mpi_is_built,
+                 lsf_exists, jsrun_installed,
+                 expected, exception)
+
     """
     Minimal mpi_run settings for tests.
     """
@@ -260,62 +361,72 @@ class RunTests(unittest.TestCase):
     Tests mpi_run with minimal settings.
     """
     def test_mpi_run_minimal(self):
-        if _get_mpi_implementation_flags(False)[0] is None:
+        if not mpi_available():
             self.skipTest("MPI is not available")
 
         cmd = ['cmd']
         settings = self.minimal_settings
-        run_func = MagicMock(return_value=0)
 
-        mpi_run(settings, None, {}, cmd, run_func=run_func)
+        def mpi_impl_flags(tcp):
+            return ["--mock-mpi-impl-flags"], ["--mock-mpi-binding-args"]
 
-        mpi_flags, binding_args = _get_mpi_implementation_flags(False)
-        self.assertIsNotNone(mpi_flags)
-        expected_cmd = ('mpirun '
-                        '--allow-run-as-root --tag-output '
-                        '-np 2 -H host '
-                        '{binding_args} '
-                        '{mpi_flags}       '
-                        'cmd').format(binding_args=' '.join(binding_args), mpi_flags=' '.join(mpi_flags))
-        expected_env = {}
-        run_func.assert_called_once_with(command=expected_cmd, env=expected_env, stdout=None, stderr=None)
+        with mock.patch("horovod.run.mpi_run._get_mpi_implementation_flags", side_effect=mpi_impl_flags):
+            with mock.patch("horovod.run.mpi_run.safe_shell_exec.execute", return_value=0) as execute:
+                mpi_run(settings, None, {}, cmd)
+
+                # call the mocked _get_mpi_implementation_flags method
+                mpi_flags, binding_args = horovod.run.mpi_run._get_mpi_implementation_flags(False)
+                self.assertIsNotNone(mpi_flags)
+                expected_cmd = ('mpirun '
+                                '--allow-run-as-root --tag-output '
+                                '-np 2 -H host '
+                                '{binding_args} '
+                                '{mpi_flags}       '
+                                'cmd').format(binding_args=' '.join(binding_args), mpi_flags=' '.join(mpi_flags))
+                expected_env = {}
+                execute.assert_called_once_with(expected_cmd, env=expected_env, stdout=None, stderr=None)
 
     """
     Tests mpi_run on a large cluster.
     """
     def test_mpi_run_on_large_cluster(self):
-        if _get_mpi_implementation_flags(False)[0] is None:
+        if not mpi_available():
             self.skipTest("MPI is not available")
 
         cmd = ['cmd']
         settings = copy.copy(self.minimal_settings)
         settings.num_hosts = large_cluster_threshold
-        run_func = MagicMock(return_value=0)
 
-        mpi_run(settings, None, {}, cmd, run_func=run_func)
+        def mpi_impl_flags(tcp):
+            return ["--mock-mpi-impl-flags"], ["--mock-mpi-binding-args"]
 
-        mpi_flags, binding_args = _get_mpi_implementation_flags(False)
-        self.assertIsNotNone(mpi_flags)
-        mpi_flags.append('-mca plm_rsh_no_tree_spawn true')
-        mpi_flags.append('-mca plm_rsh_num_concurrent {}'.format(settings.num_hosts))
-        expected_cmd = ('mpirun '
-                        '--allow-run-as-root --tag-output '
-                        '-np 2 -H host '
-                        '{binding_args} '
-                        '{mpi_flags}       '
-                        'cmd').format(binding_args=' '.join(binding_args), mpi_flags=' '.join(mpi_flags))
-        expected_env = {}
-        run_func.assert_called_once_with(command=expected_cmd, env=expected_env, stdout=None, stderr=None)
+        with mock.patch("horovod.run.mpi_run._get_mpi_implementation_flags", side_effect=mpi_impl_flags):
+            with mock.patch("horovod.run.mpi_run.safe_shell_exec.execute", return_value=0) as execute:
+                mpi_run(settings, None, {}, cmd)
+
+                # call the mocked _get_mpi_implementation_flags method
+                mpi_flags, binding_args = horovod.run.mpi_run._get_mpi_implementation_flags(False)
+                self.assertIsNotNone(mpi_flags)
+                mpi_flags.append('-mca plm_rsh_no_tree_spawn true')
+                mpi_flags.append('-mca plm_rsh_num_concurrent {}'.format(settings.num_hosts))
+                expected_cmd = ('mpirun '
+                                '--allow-run-as-root --tag-output '
+                                '-np 2 -H host '
+                                '{binding_args} '
+                                '{mpi_flags}       '
+                                'cmd').format(binding_args=' '.join(binding_args), mpi_flags=' '.join(mpi_flags))
+                expected_env = {}
+                execute.assert_called_once_with(expected_cmd, env=expected_env, stdout=None, stderr=None)
 
     """
     Tests mpi_run with full settings.
     """
     def test_mpi_run_full(self):
-        if _get_mpi_implementation_flags(False)[0] is None:
+        if not mpi_available():
             self.skipTest("MPI is not available")
 
         cmd = ['cmd', 'arg1', 'arg2']
-        common_intfs = ['eth0', 'eth1']
+        nics = ['eth0', 'eth1']
         env = {'env1': 'val1', 'env2': 'val2'}
         stdout = '<stdout>'
         stderr = '<stderr>'
@@ -333,36 +444,45 @@ class RunTests(unittest.TestCase):
             output_filename='>output filename goes here<',
             run_func_mode=True
         )
-        run_func = MagicMock(return_value=0)
 
-        mpi_run(settings, common_intfs, env, cmd, stdout=stdout, stderr=stderr, run_func=run_func)
+        def mpi_impl_flags(tcp):
+            return ["--mock-mpi-impl-flags"], []
 
-        mpi_flags, _ = _get_mpi_implementation_flags(False)
-        self.assertIsNotNone(mpi_flags)
-        expected_command = ('mpirun '
-                            '--allow-run-as-root --tag-output '
-                            '-np 1 -H >host names go here< '
-                            '>binding args go here< '
-                            '{mpi_flags} '
-                            '-mca plm_rsh_args "-p 1022" '
-                            '-mca btl_tcp_if_include eth0,eth1 -x NCCL_SOCKET_IFNAME=eth0,eth1 '
-                            '--output-filename >output filename goes here< '
-                            '-x env1 -x env2 '
-                            '>mpi-extra args go here< '
-                            'cmd arg1 arg2').format(mpi_flags=' '.join(mpi_flags))
-        expected_env = {'env1': 'val1', 'env2': 'val2'}
-        run_func.assert_called_once_with(command=expected_command, env=expected_env, stdout=stdout, stderr=stderr)
+        with mock.patch("horovod.run.mpi_run._get_mpi_implementation_flags", side_effect=mpi_impl_flags):
+            with mock.patch("horovod.run.mpi_run.safe_shell_exec.execute", return_value=0) as execute:
+                mpi_run(settings, nics, env, cmd, stdout=stdout, stderr=stderr)
+
+                # call the mocked _get_mpi_implementation_flags method
+                mpi_flags, _ = horovod.run.mpi_run._get_mpi_implementation_flags(False)
+                self.assertIsNotNone(mpi_flags)
+                expected_command = ('mpirun '
+                                    '--allow-run-as-root --tag-output '
+                                    '-np 1 -H >host names go here< '
+                                    '>binding args go here< '
+                                    '{mpi_flags} '
+                                    '-mca plm_rsh_args "-p 1022" '
+                                    '-mca btl_tcp_if_include eth0,eth1 -x NCCL_SOCKET_IFNAME=eth0,eth1 '
+                                    '--output-filename >output filename goes here< '
+                                    '-x env1 -x env2 '
+                                    '>mpi-extra args go here< '
+                                    'cmd arg1 arg2').format(mpi_flags=' '.join(mpi_flags))
+                expected_env = {'env1': 'val1', 'env2': 'val2'}
+                execute.assert_called_once_with(expected_command, env=expected_env, stdout=stdout, stderr=stderr)
 
     def test_mpi_run_with_non_zero_exit(self):
-        if _get_mpi_implementation_flags(False)[0] is None:
+        if not mpi_available():
             self.skipTest("MPI is not available")
 
         cmd = ['cmd']
         settings = self.minimal_settings
-        run_func = MagicMock(return_value=1)
 
-        with pytest.raises(RuntimeError, match="^mpirun failed with exit code 1$") as e:
-            mpi_run(settings, None, {}, cmd, run_func=run_func)
+        def mpi_impl_flags(tcp):
+            return [], []
+
+        with mock.patch("horovod.run.mpi_run._get_mpi_implementation_flags", side_effect=mpi_impl_flags):
+            with mock.patch("horovod.run.mpi_run.safe_shell_exec.execute", return_value=1):
+                with pytest.raises(RuntimeError, match="^mpirun failed with exit code 1$"):
+                    mpi_run(settings, None, {}, cmd)
 
     def test_horovodrun_hostfile(self):
         with temppath() as host_filename:
@@ -376,10 +496,10 @@ class RunTests(unittest.TestCase):
     """
     Tests js_run.
     """
-    @patch('horovod.run.js_run.is_jsrun_installed', MagicMock(return_value=True))
-    @patch('horovod.run.js_run.generate_jsrun_rankfile', MagicMock(return_value='/tmp/rankfile'))
-    @patch('horovod.run.util.lsf.LSFUtils.get_num_gpus', MagicMock(return_value=2))
-    @patch('horovod.run.util.lsf.LSFUtils.get_num_cores', MagicMock(return_value=2))
+    @mock.patch('horovod.run.js_run.is_jsrun_installed', MagicMock(return_value=True))
+    @mock.patch('horovod.run.js_run.generate_jsrun_rankfile', MagicMock(return_value='/tmp/rankfile'))
+    @mock.patch('horovod.run.util.lsf.LSFUtils.get_num_gpus', MagicMock(return_value=2))
+    @mock.patch('horovod.run.util.lsf.LSFUtils.get_num_cores', MagicMock(return_value=2))
     def test_js_run(self):
         if _get_mpi_implementation_flags(False)[0] is None:
             self.skipTest("MPI is not available")
@@ -397,27 +517,32 @@ class RunTests(unittest.TestCase):
             output_filename='>output filename goes here<',
             run_func_mode=True
         )
-        run_func = MagicMock(return_value=0)
 
-        js_run(settings, None, env, cmd, stdout=stdout, stderr=stderr, run_func=run_func)
+        def mpi_impl_flags(tcp):
+            return ["--mock-mpi-impl-flags"], []
 
-        mpi_flags, _ = _get_mpi_implementation_flags(False)
-        self.assertIsNotNone(mpi_flags)
-        expected_command = ('jsrun '
-                            '--erf_input /tmp/rankfile '
-                            '--stdio_stderr >output filename goes here< '
-                            '--stdio_stdout >output filename goes here< '
-                            '--smpiargs \'{mpi_args} >mpi-extra args go here<\' '
-                            'cmd arg1 arg2').format(mpi_args=' '.join(mpi_flags))
-        expected_env = {'env1': 'val1', 'env2': 'val2'}
-        run_func.assert_called_once_with(command=expected_command, env=expected_env, stdout=stdout, stderr=stderr)
+        with mock.patch("horovod.run.js_run._get_mpi_implementation_flags", side_effect=mpi_impl_flags):
+            with mock.patch("horovod.run.js_run.safe_shell_exec.execute", return_value=0) as execute:
+                js_run(settings, None, env, cmd, stdout=stdout, stderr=stderr)
+
+                # call the mocked _get_mpi_implementation_flags method
+                mpi_flags, _ = horovod.run.js_run._get_mpi_implementation_flags(False)
+                self.assertIsNotNone(mpi_flags)
+                expected_command = ('jsrun '
+                                    '--erf_input /tmp/rankfile '
+                                    '--stdio_stderr >output filename goes here< '
+                                    '--stdio_stdout >output filename goes here< '
+                                    '--smpiargs \'{mpi_args} >mpi-extra args go here<\' '
+                                    'cmd arg1 arg2').format(mpi_args=' '.join(mpi_flags))
+                expected_env = {'env1': 'val1', 'env2': 'val2'}
+                execute.assert_called_once_with(expected_command, env=expected_env, stdout=stdout, stderr=stderr)
 
     """
     Tests generate_jsrun_rankfile.
     """
-    @patch('horovod.run.util.lsf.LSFUtils.get_num_gpus', MagicMock(return_value=4))
-    @patch('horovod.run.util.lsf.LSFUtils.get_num_cores', MagicMock(return_value=4))
-    @patch('horovod.run.util.lsf.LSFUtils.get_num_threads', MagicMock(return_value=4))
+    @mock.patch('horovod.run.util.lsf.LSFUtils.get_num_gpus', MagicMock(return_value=4))
+    @mock.patch('horovod.run.util.lsf.LSFUtils.get_num_cores', MagicMock(return_value=4))
+    @mock.patch('horovod.run.util.lsf.LSFUtils.get_num_threads', MagicMock(return_value=4))
     def test_generate_jsrun_rankfile(self):
         settings = hvd_settings.Settings(
             num_proc=5,

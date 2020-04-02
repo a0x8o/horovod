@@ -14,11 +14,17 @@
 # ==============================================================================
 
 from __future__ import print_function
-import six
-import traceback
 import sys
 import os
-from horovod.run.common.util import env as env_util, safe_shell_exec
+
+from horovod.run.common.util import env as env_util, safe_shell_exec, tiny_shell_exec
+
+# MPI implementations
+_OMPI_IMPL = 'OpenMPI'
+_SMPI_IMPL = 'SpectrumMPI'
+_MPICH_IMPL = 'MPICH'
+_UNKNOWN_IMPL = 'Unknown'
+_MISSING_IMPL = 'Missing'
 
 # Open MPI Flags
 _OMPI_FLAGS = ['-mca pml ob1', '-mca btl ^openib']
@@ -27,6 +33,7 @@ _SMPI_FLAGS = []
 _SMPI_FLAGS_TCP = ['-tcp']
 # MPICH Flags
 _MPICH_FLAGS = []
+
 # Threshold for large cluster MPI issues:
 _LARGE_CLUSTER_THRESHOLD = 64
 # No process binding args
@@ -35,7 +42,7 @@ _NO_BINDING_ARGS = ['-bind-to none', '-map-by slot']
 _SOCKET_BINDING_ARGS = ['-bind-to socket', '-map-by socket', '-rank-by core']
 
 # MPI not found error message
-_MPI_NOT_FOUND_ERROR_MSG= ('horovodrun convenience script does not find an installed MPI.\n\n'
+_MPI_NOT_FOUND_ERROR_MSG= ('horovod does not find an installed MPI.\n\n'
                            'Choose one of:\n'
                            '1. Install Open MPI 4.0.0+ or IBM Spectrum MPI or MPICH and re-install Horovod '
                            '(use --no-cache-dir pip option).\n'
@@ -49,36 +56,72 @@ try:
 except ImportError:
     from pipes import quote
 
-def _get_mpi_implementation_flags(tcp_flag):
-    output = six.StringIO()
+
+def mpi_available():
+    return _get_mpi_implementation() not in {_UNKNOWN_IMPL, _MISSING_IMPL}
+
+
+def is_open_mpi():
+    return _get_mpi_implementation() == _OMPI_IMPL
+
+
+def is_spectrum_mpi():
+    return _get_mpi_implementation() == _SMPI_IMPL
+
+
+def is_mpich():
+    return _get_mpi_implementation() == _MPICH_IMPL
+
+
+def _get_mpi_implementation():
+    """
+    Detects the available MPI implementation by invoking `mpirun --version`.
+    This command is executed by the given execute function, which takes the
+    command as the only argument and returns (output, exit code). Output
+    represents the stdout and stderr as a string.
+
+    Returns one of:
+    - _OMPI_IMPL, _SMPI_IMPL or _MPICH_IMPL for known implementations
+    - _UNKNOWN_IMPL for any unknown implementation
+    - _MISSING_IMPL if `mpirun --version` could not be executed.
+
+    :return: string representing identified implementation
+    """
     command = 'mpirun --version'
-    try:
-        exit_code = safe_shell_exec.execute(command, stdout=output,
-                                            stderr=output)
-        output_msg = output.getvalue()
-    except Exception:
-        print(traceback.format_exc(), file=sys.stderr)
-        return None, None
-    finally:
-        output.close()
+    res = tiny_shell_exec.execute(command)
+    if res is None:
+        return _MISSING_IMPL
+    (output, exit_code) = res
 
     if exit_code == 0:
-        if 'Open MPI' in output_msg or 'OpenRTE' in output_msg:
-            return list(_OMPI_FLAGS), list(_NO_BINDING_ARGS)
-        elif 'IBM Spectrum MPI' in output_msg:
-            return list(_SMPI_FLAGS) if not tcp_flag else list(_SMPI_FLAGS_TCP), list(_SOCKET_BINDING_ARGS)
-        elif 'MPICH' in output_msg:
-            return list(_MPICH_FLAGS), list(_NO_BINDING_ARGS)
-        print('Open MPI/Spectrum MPI/MPICH not found in output of mpirun --version.',
-              file=sys.stderr)
-        return None, None
+        if 'Open MPI' in output or 'OpenRTE' in output:
+            return _OMPI_IMPL
+        elif 'IBM Spectrum MPI' in output:
+            return _SMPI_IMPL
+        elif 'MPICH' in output:
+            return _MPICH_IMPL
+
+        print('Unknown MPI implementation given in output of mpirun --version:', file=sys.stderr)
+        print(output, file=sys.stderr)
+        return _UNKNOWN_IMPL
     else:
-        print("Was not able to run %s:\n%s" % (command, output_msg),
-              file=sys.stderr)
+        print('Was unable to run {command}:'.format(command=command), file=sys.stderr)
+        print(output, file=sys.stderr)
+        return _MISSING_IMPL
+
+
+def _get_mpi_implementation_flags(tcp_flag):
+    if is_open_mpi():
+        return list(_OMPI_FLAGS), list(_NO_BINDING_ARGS)
+    elif is_spectrum_mpi():
+        return list(_SMPI_FLAGS) if not tcp_flag else list(_SMPI_FLAGS_TCP), list(_SOCKET_BINDING_ARGS)
+    elif is_mpich():
+        return list(_MPICH_FLAGS), list(_NO_BINDING_ARGS)
+    else:
         return None, None
 
 
-def mpi_run(settings, nics, env, command, stdout=None, stderr=None, run_func=safe_shell_exec.execute):
+def mpi_run(settings, nics, env, command, stdout=None, stderr=None):
     """
     Runs mpi_run.
 
@@ -92,9 +135,6 @@ def mpi_run(settings, nics, env, command, stdout=None, stderr=None, run_func=saf
                 Only used when settings.run_func_mode is True.
         stderr: Stderr of the mpi process.
                 Only used when settings.run_func_mode is True.
-        run_func: Run function to use. Must have arguments 'command' and 'env'.
-                  Only used when settings.run_func_mode is True.
-                  Defaults to safe_shell_exec.execute.
     """
     mpi_impl_flags, impl_binding_args = _get_mpi_implementation_flags(settings.tcp_flag)
     if mpi_impl_flags is None:
@@ -107,10 +147,10 @@ def mpi_run(settings, nics, env, command, stdout=None, stderr=None, run_func=saf
     # There is no need to specify localhost.
     hosts_arg = '-H {hosts}'.format(hosts=settings.hosts)
 
-    tcp_intf_arg = '-mca btl_tcp_if_include {common_intfs}'.format(
-        common_intfs=','.join(nics)) if nics else ''
-    nccl_socket_intf_arg = '-x NCCL_SOCKET_IFNAME={common_intfs}'.format(
-        common_intfs=','.join(nics)) if nics else ''
+    tcp_intf_arg = '-mca btl_tcp_if_include {nics}'.format(
+        nics=','.join(nics)) if nics else ''
+    nccl_socket_intf_arg = '-x NCCL_SOCKET_IFNAME={nics}'.format(
+        nics=','.join(nics)) if nics else ''
 
     # On large cluster runs (e.g. Summit), we need extra settings to work around OpenMPI issues
     if settings.num_hosts and settings.num_hosts >= _LARGE_CLUSTER_THRESHOLD:
@@ -151,9 +191,8 @@ def mpi_run(settings, nics, env, command, stdout=None, stderr=None, run_func=saf
 
     # Execute the mpirun command.
     if settings.run_func_mode:
-        exit_code = run_func(command=mpirun_command, env=env, stdout=stdout, stderr=stderr)
+        exit_code = safe_shell_exec.execute(mpirun_command, env=env, stdout=stdout, stderr=stderr)
         if exit_code != 0:
             raise RuntimeError("mpirun failed with exit code {exit_code}".format(exit_code=exit_code))
     else:
         os.execve('/bin/sh', ['/bin/sh', '-c', mpirun_command], env)
-

@@ -32,23 +32,20 @@ def is_jsrun_installed():
     return find_executable('jsrun') is not None
 
 
-def js_run(settings, common_intfs, env, command, stdout=None, stderr=None, run_func=safe_shell_exec.execute):
+def js_run(settings, nics, env, command, stdout=None, stderr=None):
     """
     Runs Horovod with jsrun.
 
     Args:
         settings: Settings for running jsrun.
                   Note: settings.num_proc and settings.hosts must not be None.
-        common_intfs: Interfaces to include by jsrun.
+        nics: Interfaces to include by jsrun.
         env: Environment dictionary to use for running jsrun.
         command: Command and arguments to run as a list of string.
         stdout: Stdout of the mpi process.
                 Only used when settings.run_func_mode is True.
         stderr: Stderr of the mpi process.
                 Only used when settings.run_func_mode is True.
-        run_func: Run function to use. Must have arguments 'command' and 'env'.
-                  Only used when settings.run_func_mode is True.
-                  Defaults to safe_shell_exec.execute.
     """
     mpi_impl_flags, _ = _get_mpi_implementation_flags(settings.tcp_flag)
     if mpi_impl_flags is None:
@@ -56,12 +53,12 @@ def js_run(settings, common_intfs, env, command, stdout=None, stderr=None, run_f
 
     if not is_jsrun_installed():
         raise Exception(
-            'horovodrun convenience script does not find the jsrun command.\n\n'
+            'horovod does not find the jsrun command.\n\n'
             'Please, make sure you are running on a cluster with jsrun installed or '
             'use one of the other launchers.')
 
-    if common_intfs and 'NCCL_SOCKET_IFNAME' not in env:
-        env['NCCL_SOCKET_IFNAME'] = ','.join(common_intfs)
+    if nics and 'NCCL_SOCKET_IFNAME' not in env:
+        env['NCCL_SOCKET_IFNAME'] = ','.join(nics)
 
     smpiargs = ' '.join(mpi_impl_flags)
     if settings.extra_mpi_args:
@@ -92,7 +89,7 @@ def js_run(settings, common_intfs, env, command, stdout=None, stderr=None, run_f
 
     # Execute the jsrun command.
     if settings.run_func_mode:
-        exit_code = run_func(command=jsrun_command, env=env, stdout=stdout, stderr=stderr)
+        exit_code = safe_shell_exec.execute(jsrun_command, env=env, stdout=stdout, stderr=stderr)
         if exit_code != 0:
             raise RuntimeError("jsrun failed with exit code {exit_code}".format(exit_code=exit_code))
     else:

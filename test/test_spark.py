@@ -17,12 +17,10 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
-import contextlib
 import os
 import platform
 import pytest
 import re
-import subprocess
 import time
 import unittest
 import warnings
@@ -30,21 +28,21 @@ import warnings
 from distutils.version import LooseVersion
 
 import mock
-import torch
-
 from mock import MagicMock
+import torch
 
 import pyspark
 
 from pyspark.ml.linalg import DenseVector, SparseVector, VectorUDT
-from pyspark.sql.types import ArrayType, BooleanType, DoubleType, FloatType, IntegerType, NullType, \
-    StructField, StructType
+from pyspark.sql.types import ArrayType, BooleanType, DoubleType, FloatType, IntegerType, \
+    NullType, StructField, StructType
 
 import horovod.spark
 import horovod.torch as hvd
 
+from horovod.common.util import gloo_built, mpi_built
 from horovod.run.common.util import secret
-from horovod.run.mpi_run import _get_mpi_implementation_flags
+from horovod.run.mpi_run import is_open_mpi
 from horovod.spark.common import constants, util
 from horovod.spark.common.store import HDFSStore
 from horovod.spark.task import get_available_devices
@@ -52,22 +50,12 @@ from horovod.spark.task.task_service import SparkTaskService, SparkTaskClient
 
 from spark_common import spark_session, create_test_data_from_schema, create_xor_data, local_store
 
-from common import tempdir
+from common import is_built, mpi_implementation_flags, tempdir, override_env
 
 
 # Spark will fail to initialize correctly locally on Mac OS without this
 if platform.system() == 'Darwin':
     os.environ['OBJC_DISABLE_INITIALIZE_FORK_SAFETY'] = 'YES'
-
-
-@contextlib.contextmanager
-def os_environ(env):
-    old = os.environ
-    try:
-        os.environ = env
-        yield
-    finally:
-        os.environ = old
 
 
 class SparkTests(unittest.TestCase):
@@ -80,149 +68,380 @@ class SparkTests(unittest.TestCase):
         warnings.simplefilter('module')
 
     def run(self, result=None):
-        if os.environ.get('OMPI_COMM_WORLD_RANK', '0') != '0':
-            # Running in MPI as a rank > 0, ignore.
+        if int(os.getenv('OMPI_COMM_WORLD_RANK', 0)) != 0 or int(os.getenv('HOROVOD_RANK', 0)) != 0:
+            # Running in MPI or Gloo with rank > 0, ignore.
             # Purposefully skip these silently
             return
 
-        if 'Open MPI' not in str(subprocess.check_output('mpirun --version', shell=True)):
-            self.skipTest("Open MPI not available")
-
         super(SparkTests, self).run(result)
 
-    def test_happy_run(self):
+    """
+    Test that horovod.spark.run works properly in a simple setup using MPI.
+    """
+    def test_happy_run_with_mpi(self):
+        if not (mpi_built() and is_open_mpi()):
+            self.skipTest("Open MPI is not available")
+
+        self.do_test_happy_run(use_mpi=True, use_gloo=False)
+
+    """
+    Test that horovod.spark.run works properly in a simple setup using Gloo.
+    """
+    def test_happy_run_wih_gloo(self):
+        if not gloo_built():
+            self.skipTest("Gloo is not available")
+
+        self.do_test_happy_run(use_mpi=False, use_gloo=True)
+
+    """
+    Actually tests that horovod.spark.run works properly in a simple setup.
+    """
+    def do_test_happy_run(self, use_mpi, use_gloo):
         def fn():
             hvd.init()
             res = hvd.allgather(torch.tensor([hvd.rank()])).tolist()
             return res, hvd.rank()
 
         with spark_session('test_happy_run'):
-            res = horovod.spark.run(fn, env={'PATH': os.environ.get('PATH')}, verbose=0)
-            self.assertListEqual([([0, 1], 0), ([0, 1], 1)], res)
+            with is_built(gloo_is_built=use_gloo, mpi_is_built=use_mpi):
+                res = horovod.spark.run(fn, env={'PATH': os.environ.get('PATH')},
+                                        use_mpi=use_mpi, use_gloo=use_gloo, verbose=2)
+                self.assertListEqual([([0, 1], 0), ([0, 1], 1)], res)
 
-    def test_timeout(self):
-        with spark_session('test_timeout'):
-            with pytest.raises(Exception, match='^Timed out waiting for Spark tasks to start.'):
-                horovod.spark.run(None, num_proc=4, start_timeout=5,
-                                  env={'PATH': os.environ.get('PATH')},
-                                  verbose=0)
+    """
+    Test that horovod.spark.run times out when it does not start up fast enough using MPI.
+    """
+    def test_timeout_with_mpi(self):
+        if not (mpi_built() and is_open_mpi()):
+            self.skipTest("Open MPI is not available")
 
+        self.do_test_timeout(use_mpi=True, use_gloo=False)
+
+    """
+    Test that horovod.spark.run times out when it does not start up fast enough using Gloo.
+    """
+    def test_timeout_with_gloo(self):
+        if not gloo_built():
+            self.skipTest("Gloo is not available")
+
+        self.do_test_timeout(use_mpi=False, use_gloo=True)
+
+    """
+    Actually tests that horovod.spark.run times out when it does not start up fast enough.
+    """
+    def do_test_timeout(self, use_mpi, use_gloo):
+        # with 2 cores and 4 num_proc this spark run will never start up completely and time out
+        with spark_session('test_timeout', cores=2):
+            with is_built(gloo_is_built=use_gloo, mpi_is_built=use_mpi):
+                with pytest.raises(Exception, match='^Timed out waiting for Spark tasks to start.'):
+                    horovod.spark.run(None, num_proc=4, start_timeout=5,
+                                      env={'PATH': os.environ.get('PATH')},
+                                      use_mpi=use_mpi, use_gloo=use_gloo,
+                                      verbose=0)
+
+    """
+    Test that horovod.spark.run fails with meaningful exception when mpirun cannot be found.
+    This test does not require MPI to be installed.
+    """
     def test_mpirun_not_found(self):
         start = time.time()
         with spark_session('test_mpirun_not_found'):
-            with pytest.raises(Exception, match='^mpirun failed with exit code 127$'):
-                horovod.spark.run(None, env={'PATH': '/nonexistent'}, verbose=0)
+            with is_built(gloo_is_built=False, mpi_is_built=True):
+                with mpi_implementation_flags():
+                    with pytest.raises(Exception, match='^mpirun failed with exit code 127$'):
+                        horovod.spark.run(None, env={'PATH': '/nonexistent'}, verbose=0)
         self.assertLessEqual(time.time() - start, 10, 'Failure propagation took too long')
 
     """
-    Test that horovod.spark.run invokes mpi_run properly.
+    Test that horovod.spark.run uses MPI properly.
     """
-    def test_spark_run_func(self):
+    def test_spark_run_with_mpi(self):
+        with mpi_implementation_flags():
+            self.do_test_spark_run(use_mpi=True, use_gloo=False)
+
+    """
+    Test that horovod.spark.run uses Gloo properly.
+    """
+    def test_spark_run_with_gloo(self):
+        self.do_test_spark_run(use_mpi=False, use_gloo=True)
+
+    """
+    Actually tests that horovod.spark.run invokes mpi_run properly.
+    """
+    def do_test_spark_run(self, use_mpi, use_gloo):
         env = {'env1': 'val1', 'env2': 'val2'}
         expected_env = '-x env1 -x env2'
         extra_mpi_args = '<extra args go here>'
-        self.do_test_spark_run_func(num_proc=2, extra_mpi_args=extra_mpi_args,
+        with is_built(gloo_is_built=use_gloo, mpi_is_built=use_mpi):
+            self._do_test_spark_run(num_proc=2, use_mpi=use_mpi, use_gloo=use_gloo,
+                                    extra_mpi_args=extra_mpi_args,
                                     env=env, stdout='<stdout>', stderr='<stderr>',
                                     cores=4, expected_np=2, expected_env=expected_env)
 
     """
-    Test that horovod.spark.run defaults num_proc to spark parallelism.
+    Test that horovod.spark.run defaults num_proc to spark parallelism using MPI.
     """
-    def test_spark_run_func_defaults_num_proc_to_spark_cores(self):
-        self.do_test_spark_run_func(num_proc=None, cores=2, expected_np=2)
+    def test_spark_run_defaults_num_proc_to_spark_cores_with_mpi(self):
+        with mpi_implementation_flags():
+            self.do_test_spark_run_defaults_num_proc_to_spark_cores(use_mpi=True, use_gloo=False)
 
     """
-    Test that horovod.spark.run defaults env to the full system env.
+    Test that horovod.spark.run defaults num_proc to spark parallelism using Gloo.
     """
-    def test_spark_run_func_defaults_env_to_os_env(self):
+    def test_spark_run_defaults_num_proc_to_spark_cores_with_gloo(self):
+        self.do_test_spark_run_defaults_num_proc_to_spark_cores(use_mpi=False, use_gloo=True)
+
+    """
+    Actually tests that horovod.spark.run defaults num_proc to spark parallelism.
+    """
+    def do_test_spark_run_defaults_num_proc_to_spark_cores(self, use_mpi, use_gloo):
+        self._do_test_spark_run(num_proc=None, cores=2, expected_np=2,
+                                use_mpi=use_mpi, use_gloo=use_gloo)
+
+    """
+    Test that horovod.spark.run defaults env to the full system env using MPI.
+    """
+    def test_spark_run_defaults_env_to_os_env_with_mpi(self):
+        with mpi_implementation_flags():
+            self.do_test_spark_run_defaults_env_to_os_env(use_mpi=True, use_gloo=False)
+
+    """
+    Test that horovod.spark.run defaults env to the full system env using Gloo.
+    """
+    def test_spark_run_defaults_env_to_os_env_with_gloo(self):
+        self.do_test_spark_run_defaults_env_to_os_env(use_mpi=False, use_gloo=True)
+
+    """
+    Actually tests that horovod.spark.run defaults env to the full system env.
+    """
+    def do_test_spark_run_defaults_env_to_os_env(self, use_mpi, use_gloo):
         env = {'env1': 'val1', 'env2': 'val2'}
         expected_env = '-x env1 -x env2'
 
-        with os_environ(env):
-            self.do_test_spark_run_func(env=None, expected_env=expected_env)
+        with override_env(env):
+            self._do_test_spark_run(env=None, use_mpi=use_mpi, use_gloo=use_gloo,
+                                    expected_env=expected_env)
 
     """
-    Test that horovod.spark.run raises and exception on non-zero exit code of mpi_run.
+    Test that horovod.spark.run raises an exception on non-zero exit code of mpi_run using MPI.
     """
-    def test_spark_run_func_with_non_zero_exit(self):
-        run_func = MagicMock(return_value=1)
+    def test_spark_run_with_non_zero_exit_with_mpi(self):
+        expected = '^mpirun failed with exit code 1$'
+        with mpi_implementation_flags():
+            self.do_test_spark_run_with_non_zero_exit(use_mpi=True, use_gloo=False,
+                                                      expected=expected)
 
+    """
+    Test that horovod.spark.run raises an exception on non-zero exit code of mpi_run using Gloo.
+    """
+    def test_spark_run_with_non_zero_exit_with_gloo(self):
+        expected = '^Gloo job detected that one or more processes exited with non-zero ' \
+                   'status, thus causing the job to be terminated. The first process ' \
+                   'to do so was:\nProcess name: [0-9]+\nExit code: 1$'
+        self.do_test_spark_run_with_non_zero_exit(use_mpi=False, use_gloo=True,
+                                                  expected=expected)
+
+    """
+    Actually tests that horovod.spark.run raises an exception on non-zero exit code of mpi_run.
+    """
+    def do_test_spark_run_with_non_zero_exit(self, use_mpi, use_gloo, expected):
+        def fn():
+            return 0
+
+        def mpi_impl_flags(tcp):
+            return ["--mock-mpi-impl-flags"], ["--mock-mpi-binding-args"]
+
+        def gloo_exec_command_fn(driver_addresses, settings, env):
+            def _exec_command(command, alloc_info, event):
+                return 1, 1.0
+            return _exec_command
+
+        with mock.patch("horovod.run.mpi_run._get_mpi_implementation_flags", side_effect=mpi_impl_flags):
+            with mock.patch("horovod.run.mpi_run.safe_shell_exec.execute", return_value=1):
+                with mock.patch("horovod.spark.gloo_run._exec_command_fn", side_effect=gloo_exec_command_fn):
+                    with spark_session('test_spark_run', cores=4):
+                        with is_built(gloo_is_built=use_gloo, mpi_is_built=use_mpi):
+                            with pytest.raises(Exception, match=expected):
+                                horovod.spark.run(fn, use_mpi=use_mpi, use_gloo=use_gloo, verbose=2)
+
+    """
+    Performs an actual horovod.spark.run test using MPI or Gloo.
+    """
+    def _do_test_spark_run(self, args=(), kwargs={}, num_proc=1, extra_mpi_args=None,
+                           env={}, use_mpi=None, use_gloo=None,
+                           stdout=None, stderr=None, verbose=2,
+                           cores=2, expected_np=1, expected_env=''):
+        if use_mpi:
+            self._do_test_spark_run_with_mpi(args, kwargs, num_proc, extra_mpi_args, env,
+                                             stdout, stderr, verbose, cores,
+                                             expected_np, expected_env)
+        if use_gloo:
+            self._do_test_spark_run_with_gloo(args, kwargs, num_proc, extra_mpi_args, env,
+                                              stdout, stderr, verbose, cores,
+                                              expected_np, expected_env)
+
+    """
+    Performs an actual horovod.spark.run test using MPI.
+    """
+    def _do_test_spark_run_with_mpi(self, args=(), kwargs={}, num_proc=1, extra_mpi_args=None,
+                                    env={}, stdout=None, stderr=None, verbose=2,
+                                    cores=2, expected_np=1, expected_env=''):
         def fn():
             return 1
 
-        with spark_session('test_spark_run_func', cores=4):
-            with pytest.raises(Exception, match='^mpirun failed with exit code 1$') as e:
-                horovod.spark.run(fn, verbose=0, run_func=run_func)
+        def mpi_impl_flags(tcp):
+            return ["--mock-mpi-impl-flags"], ["--mock-mpi-binding-args"]
 
-    """
-    Performs the actual horovod.spark.run test.
-    """
-    def do_test_spark_run_func(self, args=(), kwargs={}, num_proc=1, extra_mpi_args=None, env={},
-                               stdout=None, stderr=None, verbose=0,
-                               cores=2, expected_np=1, expected_env=''):
-        def fn():
-            return 1
+        with mock.patch("horovod.run.mpi_run._get_mpi_implementation_flags", side_effect=mpi_impl_flags):
+            with mock.patch("horovod.run.mpi_run.safe_shell_exec.execute", return_value=0) as execute:
+                with spark_session('test_spark_run', cores=cores):
+                    with is_built(gloo_is_built=False, mpi_is_built=True):
+                        with pytest.raises(Exception) as e:
+                            # we need to timeout horovod because our mocked methods will block Spark
+                            # this raises above exception, but allows us to catch execute's arguments
+                            horovod.spark.run(fn, args=args, kwargs=kwargs,
+                                              num_proc=num_proc, start_timeout=1,
+                                              use_mpi=True, use_gloo=False,
+                                              extra_mpi_args=extra_mpi_args, env=env,
+                                              stdout=stdout, stderr=stderr, verbose=verbose)
 
-        run_func = MagicMock(return_value=0)
+                self.assertFalse(str(e.value).startswith('Timed out waiting for Spark tasks to start.'),
+                                 'Spark timed out before mpi_run was called, test setup is broken.')
+                self.assertEqual(str(e.value), 'Spark job has failed, see the error above.')
 
-        with spark_session('test_spark_run_func', cores=cores):
-            with pytest.raises(Exception) as e:
-                # we need to timeout horovod because our mocked run_func will block spark otherwise
-                # this raises above exception, but allows us to catch run_func arguments
-                horovod.spark.run(fn, args=args, kwargs=kwargs,
-                                  num_proc=num_proc, start_timeout=1,
-                                  extra_mpi_args=extra_mpi_args, env=env,
-                                  stdout=stdout, stderr=stderr, verbose=verbose,
-                                  run_func=run_func)
+                # call the mocked _get_mpi_implementation_flags method
+                mpi_flags, binding_args = horovod.run.mpi_run._get_mpi_implementation_flags(False)
+                self.assertIsNotNone(mpi_flags)
+                expected_command = ('mpirun '
+                                    '--allow-run-as-root --tag-output '
+                                    '-np {expected_np} -H [^ ]+ '
+                                    '{binding_args} '
+                                    '{mpi_flags}  '
+                                    '-mca btl_tcp_if_include [^ ]+ -x NCCL_SOCKET_IFNAME=[^ ]+  '
+                                    '-x _HOROVOD_SECRET_KEY {expected_env}'
+                                    '{extra_mpi_args} '
+                                    '-x NCCL_DEBUG=INFO '
+                                    r'-mca plm_rsh_agent "[^"]+python[0-9]* -m horovod.spark.driver.mpirun_rsh [^ ]+ [^ ]+" '
+                                    r'[^"]+python[0-9]* -m horovod.spark.task.mpirun_exec_fn [^ ]+ [^ ]+'.format(
+                    expected_np=expected_np,
+                    binding_args=' '.join(binding_args),
+                    expected_env=expected_env + ' ' if expected_env else '',
+                    mpi_flags=' '.join(mpi_flags),
+                    extra_mpi_args=extra_mpi_args if extra_mpi_args else ''))
 
-        self.assertFalse(str(e.value).startswith('Timed out waiting for Spark tasks to start.'),
-                         'Spark timed out before mpi_run was called, test setup is broken.')
-        self.assertEqual(str(e.value), 'Spark job has failed, see the error above.')
+                execute.assert_called_once()
+                execute_args, execute_kwargs = execute.call_args
 
-        mpi_flags, binding_args = _get_mpi_implementation_flags(False)
-        self.assertIsNotNone(mpi_flags)
-        expected_command = ('mpirun '
-                            '--allow-run-as-root --tag-output '
-                            '-np {expected_np} -H [^ ]+ '
-                            '{binding_args} '
-                            '{mpi_flags}  '
-                            '-mca btl_tcp_if_include [^ ]+ -x NCCL_SOCKET_IFNAME=[^ ]+  '
-                            '-x _HOROVOD_SECRET_KEY {expected_env}'
-                            '{extra_mpi_args} '
-                            '-x NCCL_DEBUG=INFO '
-                            r'-mca plm_rsh_agent "[^"]+python[\d]* -m horovod.spark.driver.mpirun_rsh [^ ]+ [^ ]+" '
-                            r'[^"]+python[\d]* -m horovod.spark.task.mpirun_exec_fn [^ ]+ [^ ]+'.format(
-                                expected_np=expected_np,
-                                binding_args=' '.join(binding_args),
-                                expected_env=expected_env + ' ' if expected_env else '',
-                                mpi_flags=' '.join(mpi_flags),
-                                extra_mpi_args=extra_mpi_args if extra_mpi_args else ''))
-
-        run_func.assert_called_once()
-        run_func_args, run_func_kwargs = run_func.call_args
-        actual_command = run_func_kwargs.get('command')
-        actual_env = run_func_kwargs.get('env')
-        actual_stdout = run_func_kwargs.get('stdout')
-        actual_stderr = run_func_kwargs.get('stderr')
-        actual_secret = actual_env.pop('_HOROVOD_SECRET_KEY', None)
+        self.assertIsNotNone(execute_args)
+        actual_command = execute_args[0]
+        actual_env = execute_kwargs.get('env')
+        actual_stdout = execute_kwargs.get('stdout')
+        actual_stderr = execute_kwargs.get('stderr')
 
         # for better comparison replace sections in actual_command that change across runs / hosts
-        for replacement in ('-H [^ ]+', '-mca btl_tcp_if_include [^ ]+', '-x NCCL_SOCKET_IFNAME=[^ ]+',
-                            r'"[^"]+python[\d]*', r' [^"]+python[\d]*',
+        for replacement in ['-H [^ ]+', '-mca btl_tcp_if_include [^ ]+', '-x NCCL_SOCKET_IFNAME=[^ ]+',
+                            r'"[^"]+python[0-9]*', r' [^"]+python[0-9]*',
                             '-m horovod.spark.driver.mpirun_rsh [^ ]+ [^ ]+"',
-                            '-m horovod.spark.task.mpirun_exec_fn [^ ]+ [^ ]+'):
+                            '-m horovod.spark.task.mpirun_exec_fn [^ ]+ [^ ]+']:
             actual_command = re.sub(replacement, replacement, actual_command, 1)
 
-        self.assertEqual(run_func_args, ())
+        actual_secret = actual_env.pop('_HOROVOD_SECRET_KEY', None)
         self.assertEqual(actual_command, expected_command)
         if env:
-            self.assertEqual(actual_env, env)
+            self.assertEqual(env, actual_env)
         else:
             self.assertIsNotNone(actual_env)
         self.assertIsNotNone(actual_secret)
         self.assertTrue(len(actual_secret) > 0)
-        self.assertEqual(actual_stdout, stdout)
-        self.assertEqual(actual_stderr, stderr)
+        self.assertEqual(stdout, actual_stdout)
+        self.assertEqual(stderr, actual_stderr)
+
+    """
+    Performs an actual horovod.spark.run test using Gloo.
+    """
+    def _do_test_spark_run_with_gloo(self, args=(), kwargs={}, num_proc=1, extra_mpi_args=None,
+                                     env={}, stdout=None, stderr=None, verbose=2,
+                                     cores=2, expected_np=1, expected_env=''):
+        def fn():
+            return 1
+
+        exec_command = mock.MagicMock(return_value=(0, 1.0))
+        gloo_exec_command_fn = mock.MagicMock(return_value=exec_command)
+
+        with mock.patch("horovod.spark.gloo_run._exec_command_fn", side_effect=gloo_exec_command_fn):
+            with spark_session('test_spark_run', cores=cores):
+                with is_built(gloo_is_built=True, mpi_is_built=False):
+                    with pytest.raises(Exception) as e:
+                        # we need to timeout horovod because our mocked methods will block Spark
+                        # this raises above exception, but allows us to catch execute's arguments
+                        horovod.spark.run(fn, args=args, kwargs=kwargs,
+                                          num_proc=num_proc, start_timeout=1,
+                                          use_mpi=False, use_gloo=True,
+                                          extra_mpi_args=extra_mpi_args, env=env,
+                                          stdout=stdout, stderr=stderr, verbose=verbose)
+
+        self.assertFalse(str(e.value).startswith('Timed out waiting for Spark tasks to start.'),
+                         'Spark timed out before mpi_run was called, test setup is broken.')
+        self.assertEqual('Spark job has failed, see the error above.', str(e.value))
+
+        num_proc = cores if num_proc is None else num_proc
+        self.assertEqual(1, gloo_exec_command_fn.call_count)
+        self.assertEqual(num_proc, exec_command.call_count)
+        self.assertEqual(num_proc, len(exec_command.call_args_list))
+
+        # expect all ranks exist
+        # exec_command.call_args_list is [(args, kwargs)] with args = (command, alloc_info, event)
+        actual_ranks = sorted([call_args[0][1].rank for call_args in exec_command.call_args_list])
+        self.assertEqual(list(range(0, num_proc)), actual_ranks)
+
+        first_event = exec_command.call_args_list[0][0][2]
+        first_host = exec_command.call_args_list[0][0][1].hostname
+        for call_args in exec_command.call_args_list:
+            # all events are the same instance
+            self.assertEqual(first_event, call_args[0][2])
+            # all kwargs are empty
+            self.assertEqual({}, call_args[1])
+
+            # all alloc_info refer to the same host
+            alloc_info = call_args[0][1]
+            self.assertEqual(first_host, alloc_info.hostname)
+            self.assertEqual(num_proc, alloc_info.size)
+            self.assertEqual(num_proc, alloc_info.local_size)
+            self.assertEqual(alloc_info.local_rank, alloc_info.rank)
+
+            # command fully derived from alloc_info
+            expected_command = ('HOROVOD_RANK={rank} '
+                                'HOROVOD_SIZE={size} '
+                                'HOROVOD_LOCAL_RANK={local_rank} '
+                                'HOROVOD_LOCAL_SIZE={local_size} '
+                                'HOROVOD_CROSS_RANK=0 '
+                                'HOROVOD_CROSS_SIZE=1  '
+                                'PYTHONUNBUFFERED=1 '
+                                'HOROVOD_GLOO_RENDEZVOUS_ADDR=[^ ]+ '
+                                'HOROVOD_GLOO_RENDEZVOUS_PORT=[0-9]+ '
+                                'HOROVOD_CONTROLLER=gloo '
+                                'HOROVOD_CPU_OPERATIONS=gloo '
+                                'HOROVOD_GLOO_IFACE=[^ ]+ '
+                                'NCCL_SOCKET_IFNAME=[^ ]+ '
+                                '[^ ]+python[0-9]* -m horovod.spark.task.gloo_exec_fn '
+                                '[^ ]+ [^ ]+$'.format(rank=alloc_info.rank,
+                                                      size=alloc_info.size,
+                                                      local_rank=alloc_info.local_rank,
+                                                      local_size=alloc_info.local_size,
+                                                      np=num_proc))
+
+            # for better comparison replace sections in actual_command that change across runs / hosts
+            actual_command = call_args[0][0]
+            for replacement in ['_HOROVOD_SECRET_KEY=[^ ]+',
+                                'HOROVOD_GLOO_RENDEZVOUS_ADDR=[^ ]+',
+                                'HOROVOD_GLOO_RENDEZVOUS_PORT=[0-9]+',
+                                'HOROVOD_GLOO_IFACE=[^ ]+',
+                                'NCCL_SOCKET_IFNAME=[^ ]+',
+                                '[^ ]+python[0-9]*',
+                                '[^ ]+ [^ ]+$']:
+                actual_command = re.sub(replacement, replacement, actual_command, 1)
+
+            self.assertEqual(expected_command, actual_command)
 
     def test_df_cache(self):
         # Clean the cache before starting the test
@@ -763,7 +982,7 @@ class SparkTests(unittest.TestCase):
         service_env = dict([(key, '{} value'.format(key))
                             for key in SparkTaskService.SERVICE_ENV_KEYS])
         service_env.update({"other": "value"})
-        with os_environ(service_env):
+        with override_env(service_env):
             service = SparkTaskService(1, key, None)
             client = SparkTaskClient(1, service.addresses(), key, 3)
 
