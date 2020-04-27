@@ -117,7 +117,7 @@ def get_supported_instruction_set_flags(flags_to_check):
 
 def get_cpp_flags(build_ext):
     last_err = None
-    default_flags = ['-std=c++11', '-fPIC', '-O2', '-Wall', '-fassociative-math', '-ffast-math', '-ftree-vectorize', '-funsafe-math-optimizations']
+    default_flags = ['-std=c++11', '-fPIC', '-O3', '-Wall', '-fassociative-math', '-ffast-math', '-ftree-vectorize', '-funsafe-math-optimizations']
     build_arch_flags_env = os.environ.get('HOROVOD_BUILD_ARCH_FLAGS')
     build_arch_flags = get_supported_instruction_set_flags(['-mf16c', '-mavx', '-mfma']) if build_arch_flags_env is None else build_arch_flags_env.split()
     if sys.platform == 'darwin':
@@ -581,7 +581,7 @@ def get_common_options(build_ext):
     cpp_flags = get_cpp_flags(build_ext)
     link_flags = get_link_flags(build_ext)
 
-    is_mac = os.uname()[0] == 'Darwin'
+    is_mac = sys.platform == 'darwin'
     compile_without_gloo = os.environ.get('HOROVOD_WITHOUT_GLOO')
     if compile_without_gloo:
         print('INFO: HOROVOD_WITHOUT_GLOO detected, skip compiling Horovod with Gloo.')
@@ -1154,7 +1154,7 @@ def is_torch_cuda():
             headers=['horovod/torch/dummy.h'],
             sources=[],
             with_cuda=True,
-            extra_compile_args=['-std=c11', '-fPIC', '-O2']
+            extra_compile_args=['-std=c11', '-fPIC', '-O3']
         )
         cuda_test_ext.build()
         return True
@@ -1282,7 +1282,7 @@ def build_torch_extension(build_ext, global_options, torch_version):
             language='c',
             package=True,
             sources=[],
-            extra_compile_args=['-std=c11', '-fPIC', '-O2']
+            extra_compile_args=['-std=c11', '-fPIC', '-O3']
         )
         ffi_impl = create_extension(
             name='horovod.torch.mpi_lib_impl',
@@ -1575,7 +1575,7 @@ tensorflow_require_list = ['tensorflow']
 tensorflow_cpu_require_list = ['tensorflow-cpu']
 tensorflow_gpu_require_list = ['tensorflow-gpu']
 keras_require_list = ['keras>=2.0.8,!=2.0.9,!=2.1.0,!=2.1.1']
-pytorch_require_list = ['torch','torchvision']
+pytorch_require_list = ['torch']
 mxnet_require_list = ['mxnet>=1.4.1']
 spark_require_list = ['h5py>=2.9', 'numpy', 'petastorm==0.8.2', 'pyarrow>=0.15.0', 'pyspark>=2.3.2']  # Petastorm 0.7.7 is not compatible with pyarrow<0.15.0
 # all frameworks' dependencies
