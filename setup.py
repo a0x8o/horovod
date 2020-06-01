@@ -14,8 +14,6 @@
 # limitations under the License.
 # ==============================================================================
 
-from __future__ import print_function
-
 import os
 import re
 import shlex
@@ -634,21 +632,29 @@ def get_common_options(build_ext):
     if not have_gloo and not have_mpi:
         raise RuntimeError('One of Gloo or MPI are required for Horovod to run. Check the logs above for more info.')
 
-    gpu_allreduce = os.environ.get('HOROVOD_GPU_ALLREDUCE')
-    if gpu_allreduce and gpu_allreduce != 'MPI' and gpu_allreduce != 'NCCL' and \
-        gpu_allreduce != 'DDL':
-        raise DistutilsError('HOROVOD_GPU_ALLREDUCE=%s is invalid, supported '
-                             'values are "", "MPI", "NCCL", "DDL".' % gpu_allreduce)
+    gpu_operations = os.environ.get('HOROVOD_GPU_OPERATIONS')
+    if gpu_operations and gpu_operations not in {'NCCL', 'MPI'}:
+        raise DistutilsError(f'HOROVOD_GPU_OPERATIONS={gpu_operations} is invalid, '
+                             f'supported values are: NCCL, MPI.')
 
-    gpu_allgather = os.environ.get('HOROVOD_GPU_ALLGATHER')
-    if gpu_allgather and gpu_allgather != 'MPI':
-        raise DistutilsError('HOROVOD_GPU_ALLGATHER=%s is invalid, supported '
-                             'values are "", "MPI".' % gpu_allgather)
+    def get_gpu_op_variable(op_variable_name, options):
+        gpu_operation = os.environ.get(op_variable_name)
+        if gpu_operations:
+            if gpu_operation:
+                raise DistutilsError(f'Cannot specify both HOROVOD_GPU_OPERATIONS and {op_variable_name} options. '
+                                     'Try unsetting one of these variables and reinstalling.')
+            return gpu_operations
 
-    gpu_broadcast = os.environ.get('HOROVOD_GPU_BROADCAST')
-    if gpu_broadcast and gpu_broadcast != 'MPI' and gpu_broadcast != 'NCCL':
-        raise DistutilsError('HOROVOD_GPU_BROADCAST=%s is invalid, supported '
-                             'values are "", "MPI", "NCCL".' % gpu_broadcast)
+        if gpu_operation and gpu_operation not in options:
+            options_str = ', '.join(options)
+            raise DistutilsError(f'{op_variable_name}={gpu_operation} is invalid, '
+                                 f'supported values are: {options_str}.')
+
+        return gpu_operation
+
+    gpu_allreduce = get_gpu_op_variable('HOROVOD_GPU_ALLREDUCE', ['NCCL', 'MPI', 'DDL'])
+    gpu_allgather = get_gpu_op_variable('HOROVOD_GPU_ALLGATHER', ['NCCL', 'MPI'])
+    gpu_broadcast = get_gpu_op_variable('HOROVOD_GPU_BROADCAST', ['NCCL', 'MPI'])
 
     have_cuda = False
     have_rocm = False
@@ -664,7 +670,7 @@ def get_common_options(build_ext):
         else:
             raise DistutilsError("Unknown HOROVOD_GPU type '%s'" % gpu_type)
 
-    if gpu_allreduce == 'NCCL':
+    if gpu_allreduce == 'NCCL' or gpu_allgather == 'NCCL' or gpu_broadcast == 'NCCL':
         have_nccl = True
         nccl_include_dirs, nccl_lib_dirs, nccl_libs = get_nccl_vals(
             build_ext, gpu_include_dirs, gpu_lib_dirs, gpu_macros, cpp_flags, have_rocm)
@@ -674,7 +680,7 @@ def get_common_options(build_ext):
 
     if gpu_allreduce == 'DDL':
         warnings.warn('DDL backend has been deprecated. Please, start using the NCCL backend '
-                      'by building Horovod with "HOROVOD_GPU_ALLREDUCE=NCCL HOROVOD_GPU_BROADCAST=NCCL". '
+                      'by building Horovod with "HOROVOD_GPU_OPERATIONS=NCCL". '
                       'Will be removed in v0.21.0.',
                       DeprecationWarning)
         have_ddl = True
@@ -1569,7 +1575,7 @@ class custom_build_ext(build_ext):
                 'None of TensorFlow, PyTorch, or MXNet plugins were built. See errors above.')
 
 
-require_list = ['cloudpickle', 'psutil', 'pyyaml', 'six']
+require_list = ['cloudpickle', 'psutil', 'pyyaml']
 test_require_list = ['mock', 'pytest', 'pytest-forked']
 
 # framework dependencies
@@ -1579,7 +1585,11 @@ tensorflow_gpu_require_list = ['tensorflow-gpu']
 keras_require_list = ['keras>=2.0.8,!=2.0.9,!=2.1.0,!=2.1.1']
 pytorch_require_list = ['torch']
 mxnet_require_list = ['mxnet>=1.4.1']
-spark_require_list = ['h5py>=2.9', 'numpy', 'petastorm>=0.9.0', 'pyarrow>=0.15.0', 'pyspark>=2.3.2']
+pyspark_require_list = ['pyspark>=2.3.2;python_version<"3.8"',
+                        # TODO: change to 'pyspark>=3.0.0' once spark3 is released
+                        'pyspark>=3.0.0.dev;python_version>="3.8"']
+spark_require_list = ['h5py>=2.9', 'numpy', 'petastorm>=0.9.0', 'pyarrow>=0.15.0'] + \
+                     pyspark_require_list
 # all frameworks' dependencies
 all_frameworks_require_list = tensorflow_require_list + \
                               tensorflow_gpu_require_list + \
@@ -1606,8 +1616,12 @@ setup(name='horovod',
           Horovod is a distributed training framework for TensorFlow, Keras, PyTorch, and Apache MXNet.
           The goal of Horovod is to make distributed Deep Learning fast and easy to use.'''),
       url='https://github.com/horovod/horovod',
+      keywords=['deep learning', 'tensorflow', 'keras', 'pytorch', 'mxnet', 'spark', 'AI'],
       classifiers=[
-          'License :: OSI Approved :: Apache Software License'
+          'License :: OSI Approved :: Apache Software License',
+          'Development Status :: 4 - Beta',
+          'Intended Audience :: Developers',
+          'Topic :: Scientific/Engineering :: Artificial Intelligence',
       ],
       ext_modules=[tensorflow_mpi_lib, torch_mpi_lib, torch_mpi_lib_impl,
                    torch_mpi_lib_v2, mxnet_mpi_lib, gloo_lib],
@@ -1629,5 +1643,10 @@ setup(name='horovod',
           'mxnet': mxnet_require_list,
           'spark': spark_require_list
       },
+      python_requires='>=3.6',
       zip_safe=False,
-      scripts=['bin/horovodrun'])
+      entry_points={
+          'console_scripts': [
+              'horovodrun = horovod.run.runner:run_commandline'
+          ]
+      })
