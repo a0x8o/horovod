@@ -18,11 +18,8 @@ import hashlib
 import logging
 import io
 import os
-import re
 import sys
 import textwrap
-
-from shlex import quote
 
 import yaml
 
@@ -31,7 +28,7 @@ import horovod
 from horovod.common.util import (extension_available,
                                  gloo_built, mpi_built,
                                  nccl_built, ddl_built, ccl_built)
-from horovod.run.common.util import config_parser, safe_shell_exec, timeout, secret
+from horovod.run.common.util import config_parser, hosts, safe_shell_exec, secret, timeout
 from horovod.run.common.util import settings as hvd_settings
 from horovod.run.driver import driver_service
 from horovod.run.elastic import settings as elastic_settings
@@ -363,6 +360,9 @@ def parse_args():
                                     'The default value is 600 seconds. Alternatively, '
                                     'The environment variable HOROVOD_ELASTIC_TIMEOUT '
                                     'can also be used to.')
+    group_elastic.add_argument('--reset-limit', action='store', dest='reset_limit', type=int,
+                               help='Maximum number of times that the training job can scale up or down '
+                                    'the number of workers after which the job is terminated. (default: None)')
 
     group_timeline = parser.add_argument_group('timeline arguments')
     group_timeline.add_argument('--timeline-filename', action=make_override_action(override_args),
@@ -519,6 +519,7 @@ class HorovodArgs(object):
         self.max_np = None
         self.slots = None
         self.elastic_timeout = None
+        self.reset_limit = None
 
         # timeline arguments
         self.timeline_filename = None
@@ -553,42 +554,7 @@ class HorovodArgs(object):
         self.use_jsrun = None
 
 
-def parse_host_files(filename):
-    """
-    Transform the hostfile into a format of
-    <IP address> or <host name>:<Number of GPUs>
-    :param filename: Should be in <IP address> or <host name> slots=<number of GPUs>
-    :return: Comma separated string of <IP address> or <host name>:<Number of GPUs>
-    """
-    hosts = []
-    with open(filename, 'r') as f:
-        for line in f.readlines():
-            line = line.rstrip()
-            hostname = line.split()[0]
-            slots = line.split('=')[1]
-            hosts.append('{name}:{slots}'.format(name=hostname, slots=slots))
-    return ','.join(hosts)
-
-
-def parse_hosts_and_slots(hosts):
-    host_names = []
-    host_to_slots = {}
-
-    host_list = hosts.split(',')
-    pattern = re.compile(r'^[\w.-]+:[0-9]+$')
-    for host in host_list:
-        if not pattern.match(host.strip()):
-            raise ValueError('Invalid host input, please make sure it has '
-                             'format as : worker-0:2,worker-1:2.')
-        hostname, slots = host.strip().split(':')
-        host_names.append(hostname)
-        host_to_slots[hostname] = int(slots)
-    return host_names, host_to_slots
-
-
 def _run_static(args):
-    all_host_names, _ = parse_hosts_and_slots(args.hosts)
-
     nics_set = set(args.nics.split(',')) if args.nics else None
 
     # horovodrun has to finish all the checks before this timeout runs out.
@@ -612,7 +578,6 @@ def _run_static(args):
                                      start_timeout=tmout,
                                      num_proc=args.np,
                                      hosts=args.hosts,
-                                     num_hosts=len(all_host_names),
                                      output_filename=args.output_filename,
                                      run_func_mode=args.run_func is not None,
                                      nics=nics_set)
@@ -633,6 +598,7 @@ def _run_static(args):
         fn_cache = cache.Cache(CACHE_FOLDER, CACHE_STALENESS_THRESHOLD_MINUTES,
                                parameters_hash)
 
+    all_host_names, _ = hosts.parse_hosts_and_slots(args.hosts)
     if settings.verbose >= 2:
         print('Filtering local host names.')
     remote_host_names = network.filter_local_addresses(all_host_names)
@@ -682,7 +648,7 @@ def _run_elastic(args):
     if args.host_discovery_script:
         discover_hosts = discovery.HostDiscoveryScript(args.host_discovery_script, args.slots)
     elif args.hosts:
-        _, available_host_slots = parse_hosts_and_slots(args.hosts)
+        _, available_host_slots = hosts.parse_hosts_and_slots(args.hosts)
         if len(available_host_slots) < 2:
             raise ValueError('Cannot run in fault tolerance mode with fewer than 2 hosts.')
         discover_hosts = discovery.FixedHosts(available_host_slots)
@@ -702,15 +668,16 @@ def _run_elastic(args):
                                     'may need to increase the --start-timeout '
                                     'parameter if you have too many servers.')
     settings = elastic_settings.ElasticSettings(discovery=discover_hosts,
-                                                num_proc=args.np,
                                                 min_np=args.min_np or args.np,
                                                 max_np=args.max_np,
+                                                elastic_timeout=args.elastic_timeout,
+                                                reset_limit=args.reset_limit,
+                                                num_proc=args.np,
                                                 verbose=2 if args.verbose else 0,
                                                 ssh_port=args.ssh_port,
                                                 extra_mpi_args=args.mpi_args,
                                                 key=secret.make_secret_key(),
                                                 start_timeout=tmout,
-                                                elastic_timeout=args.elastic_timeout,
                                                 output_filename=args.output_filename,
                                                 run_func_mode=args.run_func is not None,
                                                 nics=args.nics)
@@ -801,7 +768,7 @@ def _run(args):
     # localhost
     if not args.hosts and not args.host_discovery_script:
         if args.hostfile:
-            args.hosts = parse_host_files(args.hostfile)
+            args.hosts = hosts.parse_host_files(args.hostfile)
         else:
             # Set hosts to localhost if not specified
             args.hosts = 'localhost:{np}'.format(np=args.np)
@@ -830,6 +797,7 @@ def run(
         min_np=None,
         max_np=None,
         slots=None,
+        reset_limit=None,
         hosts=None,
         hostfile=None,
         start_timeout=None,
@@ -858,6 +826,11 @@ def run(
     :param slots: Number of slots for processes per host. Normally 1 slot per GPU per host.
                   If slots are provided by the output of the host discovery script, then that
                   value will override this parameter.
+    :param reset_limit: Maximum number of times that the training job can scale up or down the number of workers after
+                        which the job is terminated. A reset event occurs when workers are added or removed from the
+                        job after the initial registration. So a reset_limit of 0 would mean the job cannot change
+                        membership after its initial set of workers. A reset_limit of 1 means it can resize at most
+                        once, etc.
 
     :param hosts: List of host names and the number of available slots
                   for running processes on each, of the form: <hostname>:<slots>
@@ -913,6 +886,7 @@ def run(
     hargs.min_np = min_np
     hargs.max_np = max_np
     hargs.slots = slots
+    hargs.reset_limit = reset_limit
     hargs.hosts = hosts
     hargs.hostfile = hostfile
     hargs.start_timeout = start_timeout
