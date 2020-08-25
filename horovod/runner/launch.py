@@ -39,7 +39,7 @@ from horovod.runner.mpi_run import mpi_run
 from horovod.runner.js_run import js_run, is_jsrun_installed
 from horovod.runner.http.http_client import read_data_from_kvstore, put_data_into_kvstore
 from horovod.runner.http.http_server import KVStoreServer
-
+from horovod.runner.util.remote import get_remote_command
 
 # Cached information of horovod functions be stored in this directory
 CACHE_FOLDER = os.path.join(os.path.expanduser('~'), '.horovod')
@@ -52,7 +52,7 @@ SSH_ATTEMPTS = 5
 
 
 @cache.use_cache()
-def _check_all_hosts_ssh_successful(host_addresses, ssh_port=None):
+def _check_all_hosts_ssh_successful(host_addresses, ssh_port=None, ssh_identity_file=None):
     """
     checks if ssh can successfully be performed to all the hosts.
     :param host_addresses: list of addresses to ssh into. for example,
@@ -80,14 +80,10 @@ def _check_all_hosts_ssh_successful(host_addresses, ssh_port=None):
                 output.close()
         return exit_code, output_msg
 
-    ssh_port_arg = '-p {ssh_port}'.format(
-        ssh_port=ssh_port) if ssh_port else ''
-
-    ssh_command_format = 'ssh -o PasswordAuthentication=no -o StrictHostKeyChecking=no' \
-                         ' {host} {ssh_port_arg} true'
-
-    args_list = [[ssh_command_format.format(host=host_address,
-                                            ssh_port_arg=ssh_port_arg)]
+    args_list = [[get_remote_command(local_command='true',
+                                     host=host_address,
+                                     port=ssh_port,
+                                     identity_file=ssh_identity_file)]
                  for host_address in host_addresses]
     ssh_exit_codes = \
         threads.execute_function_multithreaded(exec_command,
@@ -133,7 +129,7 @@ def check_build(verbose):
                version=horovod.__version__,
                tensorflow=get_check(extension_available('tensorflow', verbose=verbose)),
                torch=get_check(extension_available('torch', verbose=verbose)),
-               mxnet = get_check(extension_available('mxnet', verbose=verbose)),
+               mxnet=get_check(extension_available('mxnet', verbose=verbose)),
                mpi=get_check(mpi_built(verbose=verbose)),
                gloo=get_check(gloo_built(verbose=verbose)),
                nccl_ops=get_check(nccl_built(verbose=verbose)),
@@ -229,9 +225,6 @@ def parse_args():
     parser.add_argument('-cb', '--check-build', action=make_check_build_action(np_arg), nargs=0,
                         help='Shows which frameworks and libraries have been built into Horovod.')
 
-    parser.add_argument('-p', '--ssh-port', action='store', dest='ssh_port',
-                        type=int, help='SSH port on all the hosts.')
-
     parser.add_argument('--disable-cache', action='store_true',
                         dest='disable_cache',
                         help='If the flag is not set, horovodrun will perform '
@@ -272,8 +265,14 @@ def parse_args():
                              'Note that this will override any command line arguments provided before '
                              'this argument, and will be overridden by any arguments that come after it.')
 
+    group_ssh = parser.add_argument_group('SSH arguments')
+    group_ssh.add_argument('-p', '--ssh-port', action='store', dest='ssh_port',
+                           type=int, help='SSH port on all the hosts.')
+    group_ssh.add_argument('-i', '--ssh-identity-file', action='store', dest='ssh_identity_file',
+                           help='File on the driver from which the identity (private key) is read.')
+
     group_params = parser.add_argument_group('tuneable parameter arguments')
-    group_params.add_argument('--fusion-threshold-mb', action=make_override_action(override_args),type=int,
+    group_params.add_argument('--fusion-threshold-mb', action=make_override_action(override_args), type=int,
                               help='Fusion buffer threshold in MB. This is the maximum amount of '
                                    'tensor data that can be fused together into a single batch '
                                    'during allreduce / allgather. Setting 0 disables tensor fusion. '
@@ -402,13 +401,13 @@ def parse_args():
                                            action=make_override_false_action(override_args), help=argparse.SUPPRESS)
     group_library_options.add_argument('--mpi-args', action='store', dest='mpi_args',
                                        help='Extra MPI arguments to pass to mpirun. '
-                                       'They need to be passed with the equal sign to avoid parsing issues. '
-                                       'e.g. --mpi-args="--map-by ppr:6:node"')
+                                            'They need to be passed with the equal sign to avoid parsing issues. '
+                                            'e.g. --mpi-args="--map-by ppr:6:node"')
     group_library_options.add_argument('--tcp', action='store_true', dest='tcp_flag',
                                        help='If this flag is set, only TCP is used for communication.')
     group_library_options.add_argument('--binding-args', action='store', dest='binding_args',
                                        help='Process binding arguments. Default is socket for Spectrum MPI '
-                                       'and no binding for other cases. e.g. --binding-args="--rankfile myrankfile"')
+                                            'and no binding for other cases. e.g. --binding-args="--rankfile myrankfile"')
     group_library_options.add_argument('--num-nccl-streams', action=make_override_action(override_args),
                                        type=int, default=1,
                                        help='Number of NCCL streams. Only applies when running with NCCL support. '
@@ -499,6 +498,7 @@ def _run_static(args):
                                     'parameter if you have too many servers.')
     settings = hvd_settings.Settings(verbose=2 if args.verbose else 0,
                                      ssh_port=args.ssh_port,
+                                     ssh_identity_file=args.ssh_identity_file,
                                      extra_mpi_args=args.mpi_args,
                                      tcp_flag=args.tcp_flag,
                                      binding_args=args.binding_args,
@@ -522,6 +522,8 @@ def _run_static(args):
             params += str(args.hosts) + ' '
         if args.ssh_port:
             params += str(args.ssh_port)
+        if args.ssh_identity_file:
+            params += args.ssh_identity_file
         parameters_hash = hashlib.md5(params.encode('utf-8')).hexdigest()
         fn_cache = cache.Cache(CACHE_FOLDER, CACHE_STALENESS_THRESHOLD_MINUTES,
                                parameters_hash)
@@ -537,7 +539,8 @@ def _run_static(args):
         if settings.verbose >= 2:
             print('Checking ssh on all remote hosts.')
         # Check if we can ssh into all remote hosts successfully.
-        if not _check_all_hosts_ssh_successful(remote_host_names, args.ssh_port, fn_cache=fn_cache):
+        if not _check_all_hosts_ssh_successful(remote_host_names, args.ssh_port, args.ssh_identity_file,
+                                               fn_cache=fn_cache):
             raise RuntimeError('could not connect to some hosts via ssh')
         if settings.verbose >= 2:
             print('SSH was successful into all the remote hosts.')
@@ -603,6 +606,7 @@ def _run_elastic(args):
                                                 num_proc=args.np,
                                                 verbose=2 if args.verbose else 0,
                                                 ssh_port=args.ssh_port,
+                                                ssh_identity_file=args.ssh_identity_file,
                                                 extra_mpi_args=args.mpi_args,
                                                 key=secret.make_secret_key(),
                                                 start_timeout=tmout,
@@ -643,8 +647,9 @@ def run_controller(use_gloo, gloo_run, use_mpi, mpi_run, use_jsrun, js_run, verb
             raise ValueError('MPI support has not been built.  If this is not expected, ensure MPI is installed '
                              'and reinstall Horovod with HOROVOD_WITH_MPI=1 to debug the build error.')
         if not lsf.LSFUtils.using_lsf():
-            raise ValueError('Horovod did not detect an LSF job.  The jsrun launcher can only be used in that environment. '
-                             'Please, pick a different launcher for other environments.')
+            raise ValueError(
+                'Horovod did not detect an LSF job.  The jsrun launcher can only be used in that environment. '
+                'Please, pick a different launcher for other environments.')
         js_run()
     else:
         if mpi_built(verbose=verbose):
