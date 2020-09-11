@@ -71,10 +71,14 @@ class custom_build_ext(build_ext):
                       '-DCMAKE_LIBRARY_OUTPUT_DIRECTORY_{}={}'.format(config.upper(), build_dir),
                       '-DPYTHON_EXECUTABLE:FILEPATH=' + sys.executable]
 
-        make_args = ['--', '-j8'] if not os.environ.get('MAKEFLAGS') else []
+        make_args = ['-j8'] if not os.environ.get('MAKEFLAGS') else []
         if self.verbose:
             make_args.append('VERBOSE=1')
-        cmake_build_args = ['--config', config] + make_args
+
+        cmake_build_args = ['--config', config]
+        if make_args:
+            # -- specifies that these args are going to the native build tool: make
+            cmake_build_args += ['--'] + make_args
 
         if not os.path.exists(self.build_temp):
             os.makedirs(self.build_temp)
@@ -89,7 +93,20 @@ class custom_build_ext(build_ext):
             raise RuntimeError('CMake failed: {}'.format(str(e)))
 
 
+# python packages required to use horovod in general
 require_list = ['cloudpickle', 'psutil', 'pyyaml', 'dataclasses;python_version<"3.7"']
+
+# python packages required / recommended to develop horovod
+# e.g., set of framework versions pinned for development, keep in sync with Dockerfile.test.cpu
+# NOTE: do not use versions with +cpu or +gpu here as users would need to add --find-links to pip
+dev_require_list = ['tensorflow-cpu==1.15.0',
+                    'keras==2.2.4',
+                    'torch==1.2.0',
+                    'torchvision==0.4.0',
+                    'mxnet==1.5.0',
+                    'pyspark==2.4.0']
+
+# python packages required only to run tests
 test_require_list = ['mock', 'pytest', 'pytest-forked', 'parameterized']
 
 # framework dependencies
@@ -158,7 +175,16 @@ setup(name='horovod',
           'mxnet': mxnet_require_list,
           'spark': spark_require_list,
           'ray': ray_require_list,
+          'dev': dev_require_list,
       },
+      # not used by pip since 19.0: https://github.com/pypa/pip/issues/4187#issuecomment-415067034
+      # here for completeness as pip install needs some of these via -f for versions with '+cpu'
+      # for examples, see Dockerfile.test.cpu and Dockerfile.test.gpu
+      dependency_links=[
+          'https://download.pytorch.org/whl/torch_stable.html',
+          'https://download.pytorch.org/whl/nightly/cpu/torch_nightly.html',
+          'https://dist.mxnet.io/python/all'
+      ],
       python_requires='>=3.6',
       zip_safe=False,
       entry_points={

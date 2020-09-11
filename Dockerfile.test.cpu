@@ -6,6 +6,7 @@ FROM ubuntu:${UBUNTU_VERSION}
 ARG UBUNTU_VERSION=16.04
 ARG MPI_KIND=OpenMPI
 ARG PYTHON_VERSION=3.6
+# NOTE: keep versions in sync with setup.py extras_require{'dev'}:
 ARG TENSORFLOW_PACKAGE=tensorflow-cpu==1.15.0
 ARG KERAS_PACKAGE=keras==2.2.4
 ARG PYTORCH_PACKAGE=torch==1.2.0+cpu
@@ -46,6 +47,8 @@ RUN apt-get install -y python${PYTHON_VERSION} python${PYTHON_VERSION}-dev pytho
 RUN ln -s -f /usr/bin/python${PYTHON_VERSION} /usr/bin/python
 RUN wget --progress=dot:mega https://bootstrap.pypa.io/get-pip.py && python get-pip.py && rm get-pip.py
 RUN pip install -U --force pip setuptools requests pytest mock pytest-forked parameterized
+RUN echo pytest -v --capture=no --continue-on-collection-errors --junit-xml=/artifacts/junit.\$1.\${HOROVOD_RANK:-\${OMPI_COMM_WORLD_RANK:-\${PMI_RANK}}}.\$2.xml \${@:2} > /pytest.sh
+RUN cat /pytest.sh
 
 # Install Spark stand-alone cluster.
 RUN if [[ -n ${SPARK_PACKAGE} ]]; then \
