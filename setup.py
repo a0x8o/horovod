@@ -61,7 +61,7 @@ class custom_build_ext(build_ext):
     def build_extensions(self):
         cmake_bin = get_cmake_bin()
 
-        config = 'Debug' if self.debug else 'Release'
+        config = 'Debug' if self.debug else 'RelWithDebInfo'
 
         ext_name = self.extensions[0].name
         build_dir = self.get_ext_fullpath(ext_name).replace(self.get_ext_filename(ext_name), '')
@@ -175,6 +175,7 @@ setup(name='horovod',
           'spark': spark_require_list,
           'ray': ray_require_list,
           'dev': dev_require_list,
+          'test': test_require_list,
       },
       # not used by pip since 19.0: https://github.com/pypa/pip/issues/4187#issuecomment-415067034
       # here for completeness as pip install needs some of these via -f for versions with '+cpu'
