@@ -43,7 +43,7 @@ include_directories("third_party/HTTPRequest/include"
         "third_party/boost/utility/include"
         "third_party/lbfgs/include")
 
-# Predefined Eign and Flatbuffers headers path, they could be replaced by tensorflow headers path
+# Predefined Eigen and Flatbuffers headers path, they could be replaced by tensorflow headers path
 set(EIGEN_INCLUDE_PATH "${PROJECT_SOURCE_DIR}/third_party/eigen")
 set(FLATBUFFERS_INCLUDE_PATH "${PROJECT_SOURCE_DIR}/third_party/flatbuffers/include")
 
@@ -216,8 +216,9 @@ endif()
 # oneCCL
 set(CCL_ROOT $ENV{CCL_ROOT})
 if(DEFINED CCL_ROOT)
-    include_directories(${CCL_ROOT}/include)
-    list(APPEND LINKER_LIBS "${CCL_ROOT}/lib/libccl.so")
+    set(CCL_CONFIGURATION $ENV{CCL_CONFIGURATION})
+    include_directories(${CCL_ROOT}/include/${CCL_CONFIGURATION})
+    list(APPEND LINKER_LIBS "${CCL_ROOT}/lib/${CCL_CONFIGURATION}/libccl.so")
     list(APPEND SOURCES "${PROJECT_SOURCE_DIR}/horovod/common/ops/ccl_operations.cc")
     add_definitions(-DHAVE_CCL=1)
     set(HAVE_CCL TRUE)

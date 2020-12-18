@@ -9,11 +9,8 @@ from typing import Dict, Callable, Any, Optional, List
 import logging
 
 from horovod.runner.common.util import secret, timeout, hosts
-from horovod.runner.driver import driver_service
 from horovod.runner.http.http_server import RendezvousServer
-from horovod.runner.util import network
-
-from horovod.ray.driver_service import _driver_fn
+from horovod.ray.utils import detect_nics, nics_to_env_var
 
 logger = logging.getLogger(__name__)
 
@@ -68,12 +65,20 @@ class BaseHorovodWorker:
         return dict(os.environ)
 
     def start_executable(self,
-                         executable_cls=None,
-                         executable_args=None,
-                         executable_kwargs=None):
+                         executable_cls: type = None,
+                         executable_args: list = None,
+                         executable_kwargs: dict = None):
         """Instantiates the executable class with provided args.
 
         If none, self.executable = None.
+
+        Args:
+            executable_cls (type): Class of object to be created on all
+                workers.
+            executable_args (list): Initialization arguments for the
+                executable_cls.
+            executable_kwargs (dict): Initialization arguments for the
+                executable_cls.
         """
         executable_args = executable_args or []
         executable_kwargs = executable_kwargs or {}
@@ -119,21 +124,10 @@ class NodeColocator:
             assert len(gpu_ids) == num_slots, gpu_ids
         self.workers = []
 
-    def create_workers(self,
-                       executable_cls: type = None,
-                       executable_args: list = None,
-                       executable_kwargs: dict = None):
+    def create_workers(self):
         """Colocates a number of workers.
 
         Also passes on the CUDA_VISIBLE_DEVICES to each worker.
-
-        Args:
-            executable_cls (type): Class of object to be created on all
-                workers.
-            executable_args (list): Initialization arguments for the
-                executable_cls.
-            executable_kwargs (dict): Initialization arguments for the
-                executable_cls.
         """
         # Create a node ip resource label so that we can pin
         # all of the child actors to the same node. This ensures
@@ -144,7 +138,6 @@ class NodeColocator:
             num_cpus=0, num_gpus=0, resources={node_id: 0.01})
 
         rank_start = self.num_slots * self.node_rank
-
         self.workers = [
             remote_cls.remote(world_rank=rank, world_size=self.world_size)
             for rank in range(rank_start, rank_start + self.num_slots)
@@ -159,12 +152,6 @@ class NodeColocator:
         # allowing for better performance.
         for worker in self.workers:
             worker.update_env_vars.remote({"CUDA_VISIBLE_DEVICES": all_ids})
-
-        ray.get([
-            worker.start_executable.remote(executable_cls, executable_args,
-                                           executable_kwargs)
-            for worker in self.workers
-        ])
         return node_id
 
     def get_workers(self) -> List:
@@ -311,8 +298,7 @@ class RayExecutor:
     def num_workers(self):
         return self.num_hosts * self.num_slots
 
-    def _create_workers(self, host_resources, executable_cls, executable_args,
-                        executable_kwargs):
+    def _create_workers(self, host_resources):
         colocator_cls = NodeColocator.options(**host_resources)
         # Create a number of coordinators.
         colocators = [
@@ -327,12 +313,9 @@ class RayExecutor:
         # allocation from being released, along with their children from
         # going out of scope.
         self.colocators = colocators
-        e_cls, e_args, e_kwargs = (executable_cls, executable_args,
-                                   executable_kwargs)
 
-        node_ids = map_blocking(
-            lambda a: a.create_workers.remote(e_cls, e_args, e_kwargs),
-            colocators)
+        node_ids = map_blocking(lambda a: a.create_workers.remote(),
+                                colocators)
         if not len(set(node_ids)) == len(node_ids):
             raise RuntimeError("Colocator actors must "
                                f"be placed on unique nodes! Got: {node_ids}")
@@ -341,31 +324,13 @@ class RayExecutor:
         workers = map_blocking(lambda w: w.get_workers.remote(), colocators)
         return sum(workers, [])
 
-    def detect_nics(self):
-        """Decomposed version of driver_service.get_common_interfaces()."""
-        nics = None
-        all_host_names = list(self.coordinator.hostnames_by_rank)
-        remote_host_names = network.filter_local_addresses(all_host_names)
-        if len(remote_host_names) > 0:
-            nics = self.settings.nics
-            if not nics:
-                if self.settings.verbose >= 2:
-                    print('Testing interfaces on all hosts.')
+    def _start_executables(self, executable_cls, executable_args,
+                           executable_kwargs):
+        def _start_exec(worker):
+            return worker.start_executable.remote(
+                executable_cls, executable_args, executable_kwargs)
 
-                local_host_names = set(all_host_names) - set(remote_host_names)
-                nics = _driver_fn(self.colocators, all_host_names,
-                                  local_host_names, self.settings)
-
-                if self.settings.verbose >= 2:
-                    print('Interfaces on all hosts were successfully checked.')
-                    print('Common interface found: ' + ' '.join(nics))
-        else:
-            nics = driver_service.get_local_interfaces(self.settings)
-
-        return {
-            "HOROVOD_GLOO_IFACE": list(nics)[0],
-            "NCCL_SOCKET_IFNAME": ",".join(nics),  # TODO
-        }
+        map_blocking(_start_exec, self.workers)
 
     def start(self,
               executable_cls: type = None,
@@ -400,11 +365,7 @@ class RayExecutor:
 
         self.coordinator = Coordinator(self.settings)
         executable_args = executable_args or []
-        self.workers = self._create_workers(
-            resources_per_host(),
-            executable_cls=executable_cls,
-            executable_args=executable_args,
-            executable_kwargs=executable_kwargs)
+        self.workers = self._create_workers(resources_per_host())
         # Get all the hostnames of all workers
         hostnames = map_blocking(lambda w: w.hostname.remote(), self.workers)
         # Register each hostname to the coordinator. assumes the hostname
@@ -419,10 +380,17 @@ class RayExecutor:
 
         coordinator_envs = self.coordinator.establish_rendezvous()
         coordinator_envs.update(extra_env_vars)
-        coordinator_envs.update(self.detect_nics())
+        nics = detect_nics(
+            self.settings,
+            all_host_names=list(self.coordinator.hostnames_by_rank),
+            node_workers=self.colocators)
+        coordinator_envs.update(nics_to_env_var(nics))
 
         map_blocking(lambda w: w.update_env_vars.remote(coordinator_envs),
                      self.workers)
+
+        self._start_executables(executable_cls, executable_args,
+                                executable_kwargs)
 
     def execute(self, fn: Callable[["executable_cls"], Any]) -> List[Any]:
         """Executes the provided function on all workers.
