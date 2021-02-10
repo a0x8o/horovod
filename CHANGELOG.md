@@ -8,9 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
-- Added support for Intel(R) MPI in horovodrun. ([#2374](https://github.com/horovod/horovod/pull/2374))
-
-### Changed 
+### Changed
 
 ### Deprecated
 
@@ -18,7 +16,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
+## [v0.21.2] - 2021-02-08
+
+### Added
+
+- Added support for Intel(R) MPI in horovodrun. ([#2374](https://github.com/horovod/horovod/pull/2374))
+
+- Add support for callbacks in Ray Elastic Executor. ([#2639](https://github.com/horovod/horovod/pull/2639))
+
+- Added forwarding of stdout/stderr captured to driver over Gloo. ([#2646](https://github.com/horovod/horovod/pull/2646))
+
+### Fixed
+
+- Fixed broadcast_optimizer_state to handle NoneType params for PyTorch 1.8. ([#2624](https://github.com/horovod/horovod/pull/2624))
+
 - Fixed `local_rank` support for Ray. ([#2596](https://github.com/horovod/horovod/pull/2596))
+
+- Fixed DL estimators to obtain the output df schema without sampling the input. ([#2611](https://github.com/horovod/horovod/pull/2611))
+
+- Fixed wrong default for horovod.tensorflow.keras.allreduce average ([#2627](https://github.com/horovod/horovod/pull/2627))
 
 ## [v0.21.1] - 2021-01-06
 
