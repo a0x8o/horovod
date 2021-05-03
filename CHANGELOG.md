@@ -13,16 +13,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 - Added pytorch_lightning spark estimator which enables training pytorch_lightning models. ([#2713](https://github.com/horovod/horovod/pull/2713))
 
+- Supports Ray Client without code changes. ([#2882](https://github.com/horovod/horovod/pull/2882))
+
 ### Changed
 
 - Changed `alltoall` to return the received splits as a second return value if non-uniform splits are sent. ([#2631](https://github.com/horovod/horovod/pull/2631))
 - Changed ``RayExecutor`` to use [Ray Placement Groups](https://docs.ray.io/en/master/placement-group.html) for worker colocation. ([#2824](https://github.com/horovod/horovod/pull/2824))
+
 
 ### Deprecated
 
 ### Removed
 
 ### Fixed
+
+- Changed RayExecutor to use Ray node ID to enable multi-container:single-host setups. ([#2883](https://github.com/horovod/horovod/pull/2882))
 
 ## [v0.21.3] - 2021-02-15
 

@@ -46,28 +46,34 @@ class Coordinator:
     rendezvous = None
     global_rendezv_port = None
     nics = None
-    hostnames = None
+    node_id_by_rank = None
 
     def __init__(
             self,
             settings,
     ):
         self.settings = settings
-        self.hostnames_by_rank = defaultdict(list)
+        self.node_id_by_rank = defaultdict(list)
+        self._hostnames = set()
 
     @property
     def world_size(self) -> int:
-        return sum(len(ranks) for ranks in self.hostnames_by_rank.values())
+        return sum(len(ranks) for ranks in self.node_id_by_rank.values())
 
     @property
-    def hoststring(self) -> str:
+    def hostnames(self):
+        return self._hostnames
+
+    @property
+    def node_id_string(self) -> str:
         return ",".join([
-            f"{host}:{len(ranks)}"
-            for host, ranks in self.hostnames_by_rank.items()
+            f"{node_id}:{len(ranks)}"
+            for node_id, ranks in self.node_id_by_rank.items()
         ])
 
-    def register(self, hostname: str, world_rank: int):
-        self.hostnames_by_rank[hostname].append(world_rank)
+    def register(self, hostname: str, node_id: str, world_rank: int):
+        self._hostnames.add(hostname)
+        self.node_id_by_rank[node_id].append(world_rank)
 
     def finalize_registration(self) -> dict:
         """Return a dictionary for all ranks."""
@@ -75,13 +81,13 @@ class Coordinator:
 
         cross_sizes = defaultdict(int)
         cross_ranks = {}
-        for rank_list in self.hostnames_by_rank.values():
+        for rank_list in self.node_id_by_rank.values():
             for local_rank, world_rank in enumerate(rank_list):
                 cross_ranks[world_rank] = cross_sizes[local_rank]
                 cross_sizes[local_rank] += 1
 
-        for node_world_rank, (hostname, ranks) in enumerate(
-                self.hostnames_by_rank.items()):
+        for node_world_rank, (node_id, ranks) in enumerate(
+                self.node_id_by_rank.items()):
             for local_rank, world_rank in enumerate(ranks):
                 rank_to_info[world_rank] = dict(
                     HOROVOD_CROSS_RANK=cross_ranks[world_rank],
@@ -102,8 +108,8 @@ class Coordinator:
 
         # allocate processes into slots
         # hosts = parse_hosts(hosts_string="10.11.11.11:4,10.11.11.12:4")
-        parsed_hosts = hosts.parse_hosts(hosts_string=self.hoststring)
-        host_alloc_plan = hosts.get_host_assignments(parsed_hosts,
+        parsed_node_ids = hosts.parse_hosts(hosts_string=self.node_id_string)
+        host_alloc_plan = hosts.get_host_assignments(parsed_node_ids,
                                                      self.world_size)
 
         # start global rendezvous server and get port that it is listening on
@@ -111,6 +117,7 @@ class Coordinator:
         self.rendezvous.init(host_alloc_plan)
 
         return {
+            # needs to be real address
             "HOROVOD_GLOO_RENDEZVOUS_ADDR": ray.util.get_node_ip_address(),
             "HOROVOD_GLOO_RENDEZVOUS_PORT": str(self.global_rendezv_port),
             "HOROVOD_CONTROLLER": "gloo",
@@ -224,6 +231,142 @@ class RayExecutor:
             raise ValueError(
                 f"gpus_per_worker must be >= 1: Got {gpus_per_worker}.")
 
+        kwargs = dict(
+            num_workers=num_workers,
+            num_hosts=num_hosts,
+            num_workers_per_host=num_workers_per_host,
+            cpus_per_worker=cpus_per_worker,
+            use_gpu=use_gpu,
+            gpus_per_worker=gpus_per_worker,
+        )
+        self._is_remote = False
+        if ray.util.client.ray.is_connected():
+            RemoteDriver = ray.remote(_ExecutorDriver)
+            self.driver = RemoteDriver.remote(settings, **kwargs)
+            self._is_remote = True
+        else:
+            self.driver = _ExecutorDriver(settings, **kwargs)
+
+    def start(self,
+              executable_cls: type = None,
+              executable_args: Optional[List] = None,
+              executable_kwargs: Optional[Dict] = None,
+              extra_env_vars: Optional[Dict] = None):
+        """Starts the workers and colocates them on all machines.
+
+        We implement a node grouping because it seems like
+        our implementation doesn't quite work for imbalanced nodes.
+        Also, colocation performance is typically much better than
+        non-colocated workers.
+
+        Args:
+            executable_cls (type): The class that will be created within
+                an actor (BaseHorovodWorker). This will allow Horovod
+                to establish its connections and set env vars.
+            executable_args (List): Arguments to be passed into the
+                worker class upon initialization.
+            executable_kwargs (Dict): Keyword arguments to be passed into the
+                worker class upon initialization.
+            extra_env_vars (Dict): Environment variables to be set
+                on the actors (worker processes) before initialization.
+
+        """
+        kwargs_ = dict(
+            executable_cls=executable_cls,
+            executable_args=executable_args,
+            executable_kwargs=executable_kwargs,
+            extra_env_vars=extra_env_vars)
+        return self._maybe_call_ray(self.driver.start, **kwargs_)
+
+    def execute(self, fn: Callable[["executable_cls"], Any]) -> List[Any]:
+        """Executes the provided function on all workers.
+
+        Args:
+            fn: Target function to be invoked on every object.
+
+        Returns:
+            Deserialized return values from the target function.
+        """
+        kwargs_ = dict(fn=fn)
+        return self._maybe_call_ray(self.driver.execute, **kwargs_)
+
+    def run(self,
+            fn: Callable[[Any], Any],
+            args: Optional[List] = None,
+            kwargs: Optional[Dict] = None) -> List[Any]:
+        """Executes the provided function on all workers.
+
+        Args:
+            fn: Target function that can be executed with arbitrary
+                args and keyword arguments.
+            args: List of arguments to be passed into the target function.
+            kwargs: Dictionary of keyword arguments to be
+                passed into the target function.
+
+        Returns:
+            Deserialized return values from the target function.
+        """
+        kwargs_ = dict(fn=fn, args=args, kwargs=kwargs)
+        return self._maybe_call_ray(self.driver.run, **kwargs_)
+
+    def run_remote(self,
+                   fn: Callable[[Any], Any],
+                   args: Optional[List] = None,
+                   kwargs: Optional[Dict] = None) -> List[Any]:
+        """Executes the provided function on all workers.
+
+        Args:
+            fn: Target function that can be executed with arbitrary
+                args and keyword arguments.
+            args: List of arguments to be passed into the target function.
+            kwargs: Dictionary of keyword arguments to be
+                passed into the target function.
+
+        Returns:
+            list: List of ObjectRefs that you can run `ray.get` on to
+                retrieve values.
+        """
+        kwargs_ = dict(fn=fn, args=args, kwargs=kwargs)
+        return self._maybe_call_ray(self.driver.run_remote, **kwargs_)
+
+    def execute_single(self,
+                       fn: Callable[["executable_cls"], Any]) -> List[Any]:
+        """Executes the provided function on the rank 0 worker (chief).
+
+        Args:
+            fn: Target function to be invoked on the chief object.
+
+        Returns:
+            Deserialized return values from the target function.
+        """
+        kwargs = dict(fn=fn)
+        return self._maybe_call_ray(self.driver.execute_single, **kwargs)
+
+    def shutdown(self):
+        """Destroys the provided workers."""
+        result = self._maybe_call_ray(self.driver.shutdown)
+        del self.driver
+        return result
+
+    def _maybe_call_ray(self, driver_func, *args, **kwargs):
+        if self._is_remote:
+            return ray.get(driver_func.remote(*args, **kwargs))
+        else:
+            return driver_func(**kwargs)
+
+
+class _ExecutorDriver:
+    """Base driver for executing Ray calls."""
+
+    def __init__(self,
+                 settings,
+                 num_workers: Optional[int] = None,
+                 num_hosts: Optional[int] = None,
+                 num_workers_per_host: int = 1,
+                 cpus_per_worker: int = 1,
+                 use_gpu: bool = False,
+                 gpus_per_worker: Optional[int] = None):
+
         self.settings = settings
         self.num_workers = num_workers
         self.num_hosts = num_hosts
@@ -292,11 +435,12 @@ class RayExecutor:
         executable_args = executable_args or []
         self.workers, node_workers = self.strategy.create_workers()
         # Get all the hostnames of all workers
+        node_ids = map_blocking(lambda w: w.node_id.remote(), self.workers)
         hostnames = map_blocking(lambda w: w.hostname.remote(), self.workers)
         # Register each hostname to the coordinator. assumes the hostname
         # ordering is the same.
-        for rank, hostname in enumerate(hostnames):
-            self.coordinator.register(hostname, rank)
+        for rank, (hostname, node_id) in enumerate(zip(hostnames, node_ids)):
+            self.coordinator.register(hostname, node_id, rank)
         all_info = self.coordinator.finalize_registration()
 
         indexed_runners = dict(enumerate(self.workers))
@@ -307,7 +451,7 @@ class RayExecutor:
         coordinator_envs.update(extra_env_vars)
         nics = detect_nics(
             self.settings,
-            all_host_names=list(self.coordinator.hostnames_by_rank),
+            all_host_names=list(self.coordinator.hostnames),
             node_workers=node_workers)
         coordinator_envs.update(nics_to_env_var(nics))
 

@@ -8,6 +8,7 @@ import sys
 import socket
 import pytest
 import ray
+from ray.util.client.ray_client_helpers import ray_start_client_server
 import torch
 
 from horovod.common.util import gloo_built
@@ -27,7 +28,7 @@ def ray_start_2_cpus():
 
 @pytest.fixture
 def ray_start_4_cpus():
-    address_info = ray.init(num_cpus=4, _redis_max_memory=1024*1024*1024)
+    address_info = ray.init(num_cpus=4, _redis_max_memory=1024 * 1024 * 1024)
     yield address_info
     # The code after the yield will run as teardown code.
     ray.shutdown()
@@ -51,6 +52,21 @@ def ray_start_4_cpus_4_gpus():
     del os.environ["CUDA_VISIBLE_DEVICES"]
 
 
+@pytest.fixture
+def ray_start_client():
+    def ray_connect_handler(job_config=None):
+        # Ray client will disconnect from ray when
+        # num_clients == 0.
+        if ray.is_initialized():
+            return
+        else:
+            return ray.init(job_config=job_config, num_cpus=4)
+
+    assert not ray.util.client.ray.is_connected()
+    with ray_start_client_server(ray_connect_handler=ray_connect_handler):
+        yield
+
+
 def check_resources(original_resources):
     for i in reversed(range(10)):
         if original_resources == ray.available_resources():
@@ -66,13 +82,13 @@ def test_coordinator_registration():
     settings = MiniSettings()
     coord = Coordinator(settings)
     assert coord.world_size == 0
-    assert coord.hoststring == ""
+    assert coord.node_id_string == ""
     ranks = list(range(12))
 
     for i, hostname in enumerate(["a", "b", "c"]):
         for r in ranks:
             if r % 3 == i:
-                coord.register(hostname, world_rank=r)
+                coord.register(hostname, node_id=str(i), world_rank=r)
 
     rank_to_info = coord.finalize_registration()
     assert len(rank_to_info) == len(ranks)
@@ -86,20 +102,27 @@ def test_coordinator_registration():
             for info in rank_to_info.values()} == {0, 1, 2, 3}
 
 
-def test_cross_rank():
+@pytest.mark.parametrize("use_same_host", [True, False])
+def test_cross_rank(use_same_host):
     settings = MiniSettings()
     coord = Coordinator(settings)
     assert coord.world_size == 0
-    assert coord.hoststring == ""
+    assert coord.node_id_string == ""
     ranks = list(range(12))
 
     for r in ranks:
         if r < 5:
-            coord.register("host1", world_rank=r)
+            coord.register("host1", node_id="host1", world_rank=r)
         elif r < 9:
-            coord.register("host2", world_rank=r)
+            coord.register(
+                "host1" if use_same_host else "host2",
+                node_id="host2",
+                world_rank=r)
         else:
-            coord.register("host3", world_rank=r)
+            coord.register(
+                "host1" if use_same_host else "host3",
+                node_id="host3",
+                world_rank=r)
 
     rank_to_info = coord.finalize_registration()
     assert len(rank_to_info) == len(ranks)
@@ -152,11 +175,37 @@ def test_gpu_ids(ray_start_4_cpus_4_gpus):
     hjob = RayExecutor(
         setting, num_hosts=1, num_workers_per_host=4, use_gpu=True)
     hjob.start()
-    worker_handles = hjob.workers
-    all_envs = ray.get([h.env_vars.remote() for h in worker_handles])
+    all_envs = hjob.execute(lambda _: os.environ.copy())
     all_cudas = {ev["CUDA_VISIBLE_DEVICES"] for ev in all_envs}
     assert len(all_cudas) == 1, all_cudas
     assert len(all_envs[0]["CUDA_VISIBLE_DEVICES"].split(",")) == 4
+    hjob.shutdown()
+    assert check_resources(original_resources)
+
+
+@pytest.mark.skipif(
+    torch.cuda.device_count() < 4, reason="GPU test requires 4 GPUs")
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="GPU test requires CUDA.")
+def test_gpu_ids_num_workers(ray_start_4_cpus_4_gpus):
+    original_resources = ray.available_resources()
+    setting = RayExecutor.create_settings(timeout_s=30)
+    hjob = RayExecutor(setting, num_workers=4, use_gpu=True)
+    hjob.start()
+    all_envs = hjob.execute(lambda _: os.environ.copy())
+    all_cudas = {ev["CUDA_VISIBLE_DEVICES"] for ev in all_envs}
+
+    assert len(all_cudas) == 1, all_cudas
+    assert len(all_envs[0]["CUDA_VISIBLE_DEVICES"].split(",")) == 4
+
+    def _test(worker):
+        import horovod.torch as hvd
+        hvd.init()
+        local_rank = str(hvd.local_rank())
+        return local_rank in os.environ["CUDA_VISIBLE_DEVICES"]
+
+    all_valid_local_rank = hjob.execute(_test)
+    assert all(all_valid_local_rank)
     hjob.shutdown()
     assert check_resources(original_resources)
 
@@ -369,6 +418,26 @@ def test_horovod_train(ray_start_4_cpus, num_workers, num_hosts,
     hjob.start()
     result = hjob.execute(simple_fn)
     assert set(result) == {0, 1, 2, 3}
+    hjob.shutdown()
+
+
+@pytest.mark.skipif(
+    not gloo_built(), reason='Gloo is required for Ray integration')
+def test_remote_client_train(ray_start_client):
+    def simple_fn(worker):
+        local_rank = _train()
+        return local_rank
+
+    assert ray.util.client.ray.is_connected()
+
+    setting = RayExecutor.create_settings(timeout_s=30)
+    hjob = RayExecutor(
+        setting, num_workers=3, use_gpu=torch.cuda.is_available())
+    hjob.start()
+    result = hjob.execute(simple_fn)
+    assert set(result) == {0, 1, 2}
+    result = ray.get(hjob.run_remote(simple_fn, args=[None]))
+    assert set(result) == {0, 1, 2}
     hjob.shutdown()
 
 
