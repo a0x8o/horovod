@@ -76,13 +76,15 @@ def RemoteTrainer(estimator, metadata, ckpt_bytes, run_id, dataset_idx, train_ro
         schema_fields.append(sample_weight_col)
 
     data_loader_cls = _create_dataloader(feature_columns, input_shapes, metadata, data_loader_cls)
-    set_data_loader = _set_data_loader_fn(transformation, schema_fields,
-                                                      batch_size, calculate_shuffle_buffer_size,
-                                                      data_loader_cls, loader_num_epochs)
 
     # Storage
     store = estimator.getStore()
     remote_store = store.to_remote(run_id, dataset_idx)
+
+    set_data_loader = _set_data_loader_fn(transformation, schema_fields,
+                                          batch_size, calculate_shuffle_buffer_size,
+                                          data_loader_cls, loader_num_epochs, store)
+
 
     def train(serialized_model):
         import horovod.torch as hvd
@@ -126,6 +128,12 @@ def RemoteTrainer(estimator, metadata, ckpt_bytes, run_id, dataset_idx, train_ro
                 _val_steps_per_epoch = int(math.floor(float(val_rows) / batch_size / hvd.size()))
 
             cuda_available = torch.cuda.is_available()
+            # We need to check all ranks have same device type for traning.
+            # Horovod doesn't support heterogeneous allreduce for gradients.
+            cuda_avail_list = hvd.allgather_object(cuda_available, name='device type')
+            if cuda_avail_list.count(cuda_available) != hvd.size():
+                raise RuntimeError("All ranks don't have same device type!")
+
             if cuda_available:
                 # Horovod: pin GPU to local rank or the assigned GPU from spark.
                 torch.cuda.set_device(_get_assigned_gpu_or_default(default=hvd.local_rank()))
@@ -206,7 +214,7 @@ def _make_reset_callbacks():
     return [ResetCallback()]
 
 
-def _set_data_loader_fn(transformation, schema_fields, batch_size, calculate_shuffle_buffer_size, data_loader_cls, num_epochs):
+def _set_data_loader_fn(transformation, schema_fields, batch_size, calculate_shuffle_buffer_size, data_loader_cls, num_epochs, store):
 
     @contextlib.contextmanager
     def set_data_loader(model, data_path, dataloader_attr, reader_worker_count, reader_pool_type, should_read=True):
@@ -248,6 +256,7 @@ def _set_data_loader_fn(transformation, schema_fields, batch_size, calculate_shu
                             hdfs_driver=PETASTORM_HDFS_DRIVER,
                             schema_fields=schema_fields,
                             transform_spec=transform_spec,
+                            storage_options=store.storage_options,
                             **reader_factory_kwargs) as reader:
             def dataloader_fn():
                 return data_loader_cls(reader=reader, batch_size=batch_size,
