@@ -59,6 +59,7 @@ def RemoteTrainer(estimator, metadata, ckpt_bytes, run_id, dataset_idx, train_ro
     data_module = estimator.getDataModule() if estimator.getDataModule() else PetastormDataModule
     loader_num_epochs = estimator.getLoaderNumEpochs()
     verbose = (estimator.getVerbose() > 0)
+    trainer_args = estimator.getTrainerArgs()
 
     # get logger
     logger = estimator.getLogger()
@@ -184,6 +185,10 @@ def RemoteTrainer(estimator, metadata, ckpt_bytes, run_id, dataset_idx, train_ro
             if _num_gpus is None:
                 _num_gpus = 1 if cuda_available else 0
 
+            # Set bar refresh to 1 / epoch, detailed loss and metrics is avaialbe in logger,
+            # no need to print in screen here. User can still override this in trainer_args
+            progress_bar_refresh_rate = _train_steps_per_epoch
+
             kwargs = {'accelerator': 'horovod',
                       'gpus': _num_gpus,
                       'callbacks': callbacks,
@@ -192,10 +197,13 @@ def RemoteTrainer(estimator, metadata, ckpt_bytes, run_id, dataset_idx, train_ro
                       'log_every_n_steps': log_every_n_steps,
                       'num_sanity_val_steps': 0,
                       'reload_dataloaders_every_epoch': False,
-                      'progress_bar_refresh_rate': _train_steps_per_epoch // 10,
+                      'progress_bar_refresh_rate': progress_bar_refresh_rate,
                       'terminate_on_nan': terminate_on_nan,
                       'profiler': profiler
                       }
+            if trainer_args:
+                kwargs.update(trainer_args)
+
             print("Creating trainer with: \n ", kwargs)
             trainer = Trainer(**kwargs)
 
@@ -240,10 +248,10 @@ def RemoteTrainer(estimator, metadata, ckpt_bytes, run_id, dataset_idx, train_ro
                 serialized_checkpoint = io.BytesIO()
                 module = best_model if not is_legacy else best_model._model
 
-                # TODO: find a way to pass trainer.logged_metrics out.
-                output = {'model': module.state_dict()}
+                output = {'model': module.state_dict(), 'logged_metrics': trainer.logged_metrics}
 
                 torch.save(output, serialized_checkpoint)
+
                 return serialized_checkpoint
     return train
 
